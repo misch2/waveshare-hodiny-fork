@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ConfigurationWebRoutes.h"
 #include "ClockConfig.h"
 
 using ClockConfigLoadCallback = void (*)(ClockConfig &config);
@@ -29,9 +30,19 @@ void configurationWebBegin(ClockConfigLoadCallback loadCallback,
                            DayNightStatusCallback dayNightStatusCallback,
                            DisplayPowerCallback displayPowerCallback,
                            DisplayPowerStatusCallback displayPowerStatusCallback);
+bool configurationWebBeginWithOptions(
+    const ConfigurationWebRoutes& options,
+    ClockConfigLoadCallback loadCallback, ClockConfigSaveCallback saveCallback,
+    ConfigurationWebStatusCallback statusCallback,
+    SunTransitionTimesCallback sunTimesCallback,
+    HomeAssistantRefreshCallback refreshCallback,
+    DayNightStatusCallback dayNightStatusCallback,
+    DisplayPowerCallback displayPowerCallback,
+    DisplayPowerStatusCallback displayPowerStatusCallback);
 void configurationWebLoop();
 void configurationWebEnsureActive();
 void configurationWebExtendAvailability();
+bool configurationWebActive();
 ConfigurationWebMode configurationWebMode();
 bool configurationWebSetMode(ConfigurationWebMode mode);
 void configurationWebLockForTest();

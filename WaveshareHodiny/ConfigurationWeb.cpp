@@ -22,7 +22,12 @@
 #include "NetworkDiagnostics.h"
 
 namespace {
-WebServer server(80);
+WebServer *serverInstance = nullptr;
+WebServer &ownedServer() {
+  static WebServer instance(80);
+  return instance;
+}
+#define server (*serverInstance)
 ClockConfigLoadCallback configLoadCallback = nullptr;
 ClockConfigSaveCallback configSaveCallback = nullptr;
 ConfigurationWebStatusCallback webStatusCallback = nullptr;
@@ -31,6 +36,8 @@ HomeAssistantRefreshCallback homeAssistantRefreshCallback = nullptr;
 DayNightStatusCallback currentDayNightStatusCallback = nullptr;
 DisplayPowerCallback currentDisplayPowerCallback = nullptr;
 DisplayPowerStatusCallback currentDisplayPowerStatusCallback = nullptr;
+ConfigurationStorageBeginCallback storageBeginCallback = nullptr;
+ConfigurationStorageEndCallback storageEndCallback = nullptr;
 ClockConfig configBuffer;
 constexpr unsigned long WEB_AVAILABILITY_MS = 10UL * 60UL * 1000UL;
 bool webActive = false;
@@ -70,6 +77,40 @@ WebSession webSessions[WEB_SESSION_COUNT];
 size_t nextWebSessionSlot = 0;
 uint8_t failedLoginAttempts = 0;
 unsigned long loginBlockedUntil = 0;
+String configurationPagePath = CONFIGURATION_WEB_DEFAULT_PAGE_PATH;
+String configurationApiPrefix = CONFIGURATION_WEB_DEFAULT_API_PREFIX;
+bool legacyAliasesEnabled = true;
+bool serverLifecycleManaged = true;
+
+String normalizedPagePath(const char *path) {
+  String result = path == nullptr ? String() : String(path);
+  result.trim();
+  if (result.isEmpty()) result = CONFIGURATION_WEB_DEFAULT_PAGE_PATH;
+  if (!result.startsWith("/")) result = String('/') + result;
+  if (!result.endsWith("/")) result += '/';
+  return result;
+}
+
+String normalizedApiPrefix(const char *prefix) {
+  String result = prefix == nullptr ? String() : String(prefix);
+  result.trim();
+  if (result.isEmpty()) result = CONFIGURATION_WEB_DEFAULT_API_PREFIX;
+  if (!result.startsWith("/")) result = String('/') + result;
+  while (result.length() > 1 && result.endsWith("/")) result.remove(result.length() - 1);
+  return result;
+}
+
+String apiPath(const char *suffix) {
+  return configurationApiPrefix + suffix;
+}
+
+bool beginStorageTransaction() {
+  return storageBeginCallback == nullptr || storageBeginCallback();
+}
+
+bool endStorageTransaction() {
+  return storageEndCallback == nullptr || storageEndCallback();
+}
 
 uint32_t bytesChecksum(const uint8_t *bytes, size_t size) {
   uint32_t hash = 2166136261u;
@@ -717,7 +758,13 @@ void handleWebPassword() {
       sendError(409, F("Ochrana heslem už je vypnutá."));
       return;
     }
-    if (!eraseWebPassword()) {
+    if (!beginStorageTransaction()) {
+      sendError(503, F("Úložiště nastavení nyní není dostupné."));
+      return;
+    }
+    const bool removed = eraseWebPassword();
+    const bool storageFinished = endStorageTransaction();
+    if (!removed || !storageFinished) {
       sendError(500, F("Heslo se nepodařilo vymazat z paměti."));
       return;
     }
@@ -741,7 +788,13 @@ void handleWebPassword() {
     sendError(400, F("Heslo musí mít 6 až 20 znaků."));
     return;
   }
-  if (!persistWebPassword(password)) {
+  if (!beginStorageTransaction()) {
+    sendError(503, F("Úložiště nastavení nyní není dostupné."));
+    return;
+  }
+  const bool persisted = persistWebPassword(password);
+  const bool storageFinished = endStorageTransaction();
+  if (!persisted || !storageFinished) {
     sendError(500, F("Heslo se nepodařilo uložit do paměti."));
     return;
   }
@@ -1134,12 +1187,20 @@ void handleSaveConfig() {
       constrain(server.arg("secondDotBrightness").toInt(), 0, 255);
   config.schemaVersion = CLOCK_CONFIG_SCHEMA_VERSION;
 
-  if (configSaveCallback == nullptr ||
-      !configSaveCallback(config, !submittedToken.isEmpty())) {
+  if (!beginStorageTransaction()) {
+    sendError(503, F("Úložiště nastavení nyní není dostupné."));
+    return;
+  }
+  const bool configSaved =
+      configSaveCallback != nullptr &&
+      configSaveCallback(config, !submittedToken.isEmpty());
+  const bool webModeSaved = configSaved && persistWebMode(requestedWebMode);
+  const bool storageFinished = endStorageTransaction();
+  if (!configSaved || !storageFinished) {
     sendError(500, F("Nastavení se nepodařilo uložit do paměti."));
     return;
   }
-  if (!persistWebMode(requestedWebMode)) {
+  if (!webModeSaved) {
     sendError(500, F("Režim webového serveru se nepodařilo uložit."));
     return;
   }
@@ -1347,8 +1408,13 @@ void handleDayNightRefresh() {
 
 void handleControlRequest() {
   const String uri = server.uri();
-  constexpr char PREFIX[] = "/api/control/";
-  if (!uri.startsWith(PREFIX)) {
+  const String canonicalPrefix = apiPath("/control/");
+  const String legacyPrefix = F("/api/control/");
+  const String *matchedPrefix = nullptr;
+  if (uri.startsWith(canonicalPrefix)) matchedPrefix = &canonicalPrefix;
+  else if (legacyAliasesEnabled && uri.startsWith(legacyPrefix))
+    matchedPrefix = &legacyPrefix;
+  if (matchedPrefix == nullptr) {
     sendError(404, F("Stránka nebyla nalezena."));
     return;
   }
@@ -1356,7 +1422,7 @@ void handleControlRequest() {
     sendError(405, F("Tento příkaz vyžaduje metodu POST."));
     return;
   }
-  const int secretStart = strlen(PREFIX);
+  const int secretStart = matchedPrefix->length();
   const int secretEnd = uri.indexOf('/', secretStart);
   if (secretEnd < 0 ||
       !controlSecretMatches(uri.substring(secretStart, secretEnd))) {
@@ -1437,16 +1503,69 @@ void handleFirmwareInstall() {
   sendJson(202,
            F("{\"ok\":true,\"message\":\"Kontrola a aktualizace byly spuštěny.\"}"));
 }
-}  // namespace
 
-void configurationWebBegin(ClockConfigLoadCallback loadCallback,
-                           ClockConfigSaveCallback saveCallback,
-                           ConfigurationWebStatusCallback statusCallback,
-                           SunTransitionTimesCallback sunTimesCallback,
-                           HomeAssistantRefreshCallback refreshCallback,
-                           DayNightStatusCallback dayNightStatusCallback,
-                           DisplayPowerCallback displayPowerCallback,
-                           DisplayPowerStatusCallback displayPowerStatusCallback) {
+void registerApiRoutes(const String &prefix) {
+  server.on(prefix + F("/auth/login"), HTTP_POST, handleWebLogin);
+  server.on(prefix + F("/web-password"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleWebPassword();
+  });
+  server.on(prefix + F("/config"), HTTP_GET, []() {
+    if (requireConfigurationAccess()) handleGetConfig();
+  });
+  server.on(prefix + F("/config"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleSaveConfig();
+  });
+  server.on(prefix + F("/ha/test"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleTestConnection();
+  });
+  server.on(prefix + F("/open-meteo/location"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleOpenMeteoLocation();
+  });
+  server.on(prefix + F("/restart"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleRestart();
+  });
+  server.on(prefix + F("/firmware"), HTTP_GET, []() {
+    if (requireConfigurationAccess()) handleFirmwareStatus();
+  });
+  server.on(prefix + F("/firmware/check"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleFirmwareCheck();
+  });
+  server.on(prefix + F("/firmware/install"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleFirmwareInstall();
+  });
+  server.on(prefix + F("/update-status"), HTTP_GET, []() {
+    if (requireConfigurationAccess()) handleFirmwareStatus();
+  });
+  server.on(prefix + F("/check-update"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleFirmwareCheck();
+  });
+  server.on(prefix + F("/install-update"), HTTP_POST, []() {
+    if (requireConfigurationAccess()) handleFirmwareInstall();
+  });
+  server.on(prefix + F("/diagnostics"), HTTP_GET, handleDiagnostics);
+  server.on(prefix + F("/status"), HTTP_GET, handleDiagnostics);
+  server.on(prefix + F("/runtime"), HTTP_GET, handleDiagnostics);
+
+  if (!controlSecret.isEmpty()) {
+    const String controlBase = prefix + F("/control/") + controlSecret;
+    server.on(controlBase + F("/display/off"), HTTP_POST,
+              handleControlRequest);
+    server.on(controlBase + F("/display/on"), HTTP_POST,
+              handleControlRequest);
+    server.on(controlBase + F("/day-night/refresh"), HTTP_POST,
+              handleControlRequest);
+  }
+}
+
+void initializeConfigurationWeb(
+    ClockConfigLoadCallback loadCallback,
+    ClockConfigSaveCallback saveCallback,
+    ConfigurationWebStatusCallback statusCallback,
+    SunTransitionTimesCallback sunTimesCallback,
+    HomeAssistantRefreshCallback refreshCallback,
+    DayNightStatusCallback dayNightStatusCallback,
+    DisplayPowerCallback displayPowerCallback,
+    DisplayPowerStatusCallback displayPowerStatusCallback) {
   configLoadCallback = loadCallback;
   configSaveCallback = saveCallback;
   webStatusCallback = statusCallback;
@@ -1465,60 +1584,84 @@ void configurationWebBegin(ClockConfigLoadCallback loadCallback,
         static_cast<uint8_t>(CONFIGURATION_WEB_DISABLED)));
     preferences.end();
   }
+
   const char *collectedHeaders[] = {"Cookie", "Origin"};
   server.collectHeaders(collectedHeaders, 2);
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/auth/login", HTTP_POST, handleWebLogin);
-  server.on("/api/web-password", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleWebPassword();
-  });
-  server.on("/api/config", HTTP_GET, []() {
-    if (requireConfigurationAccess()) handleGetConfig();
-  });
-  server.on("/api/config", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleSaveConfig();
-  });
-  server.on("/api/ha/test", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleTestConnection();
-  });
-  server.on("/api/open-meteo/location", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleOpenMeteoLocation();
-  });
-  server.on("/api/restart", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleRestart();
-  });
-  server.on("/api/firmware", HTTP_GET, []() {
-    if (requireConfigurationAccess()) handleFirmwareStatus();
-  });
-  server.on("/api/firmware/check", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareCheck();
-  });
-  server.on("/api/firmware/install", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareInstall();
-  });
-  server.on("/api/update-status", HTTP_GET, []() {
-    if (requireConfigurationAccess()) handleFirmwareStatus();
-  });
-  server.on("/api/check-update", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareCheck();
-  });
-  server.on("/api/install-update", HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareInstall();
-  });
-  server.on("/api/diagnostics", HTTP_GET, handleDiagnostics);
-  server.on("/api/status", HTTP_GET, handleDiagnostics);
-  server.on("/api/runtime", HTTP_GET, handleDiagnostics);
-  server.onNotFound(handleControlRequest);
-  server.begin();
+  server.on(configurationPagePath, HTTP_GET, handleRoot);
+  String pageWithoutSlash = configurationPagePath;
+  if (pageWithoutSlash.length() > 1 && pageWithoutSlash.endsWith("/")) {
+    pageWithoutSlash.remove(pageWithoutSlash.length() - 1);
+    server.on(pageWithoutSlash, HTTP_GET, []() {
+      server.sendHeader(F("Location"), configurationPagePath);
+      server.send(302, F("text/plain; charset=utf-8"), String());
+    });
+  }
+  registerApiRoutes(configurationApiPrefix);
+
+  if (legacyAliasesEnabled) {
+    if (configurationPagePath != "/") server.on("/", HTTP_GET, handleRoot);
+    if (configurationApiPrefix != "/api") registerApiRoutes(F("/api"));
+  }
+  if (serverLifecycleManaged) {
+    server.onNotFound([]() {
+      sendError(404, F("Stránka nebyla nalezena."));
+    });
+    server.begin();
+  }
+
   if (selectedWebMode != CONFIGURATION_WEB_DISABLED) {
     unlockConfiguration(true);
   } else {
     notifyWebStatus();
   }
 }
+}  // namespace
+
+void configurationWebBegin(ClockConfigLoadCallback loadCallback,
+                           ClockConfigSaveCallback saveCallback,
+                           ConfigurationWebStatusCallback statusCallback,
+                           SunTransitionTimesCallback sunTimesCallback,
+                           HomeAssistantRefreshCallback refreshCallback,
+                           DayNightStatusCallback dayNightStatusCallback,
+                           DisplayPowerCallback displayPowerCallback,
+                           DisplayPowerStatusCallback displayPowerStatusCallback) {
+  ConfigurationWebRoutes options;
+  configurationWebBeginWithOptions(
+      options, loadCallback, saveCallback, statusCallback, sunTimesCallback,
+      refreshCallback, dayNightStatusCallback, displayPowerCallback,
+      displayPowerStatusCallback);
+}
+
+bool configurationWebBeginWithOptions(
+    const ConfigurationWebRoutes &options,
+    ClockConfigLoadCallback loadCallback, ClockConfigSaveCallback saveCallback,
+    ConfigurationWebStatusCallback statusCallback,
+    SunTransitionTimesCallback sunTimesCallback,
+    HomeAssistantRefreshCallback refreshCallback,
+    DayNightStatusCallback dayNightStatusCallback,
+    DisplayPowerCallback displayPowerCallback,
+    DisplayPowerStatusCallback displayPowerStatusCallback) {
+  if (!options.manageServerLifecycle && options.webServer == nullptr)
+    return false;
+  if ((options.storageBegin == nullptr) != (options.storageEnd == nullptr))
+    return false;
+  serverInstance =
+      options.webServer == nullptr ? &ownedServer() : options.webServer;
+  configurationPagePath = normalizedPagePath(options.pagePath);
+  configurationApiPrefix = normalizedApiPrefix(options.apiPrefix);
+  legacyAliasesEnabled = options.registerLegacyAliases;
+  serverLifecycleManaged = options.manageServerLifecycle;
+  storageBeginCallback = options.storageBegin;
+  storageEndCallback = options.storageEnd;
+  initializeConfigurationWeb(
+      loadCallback, saveCallback, statusCallback, sunTimesCallback,
+      refreshCallback, dayNightStatusCallback, displayPowerCallback,
+      displayPowerStatusCallback);
+  return true;
+}
 
 void configurationWebLoop() {
-  server.handleClient();
+  if (serverLifecycleManaged) server.handleClient();
   if (selectedWebMode == CONFIGURATION_WEB_TIMED &&
       webActive && static_cast<long>(millis() - webAvailableUntil) >= 0) {
     lockConfiguration();
@@ -1535,11 +1678,16 @@ void configurationWebExtendAvailability() {
     unlockConfiguration(true);
 }
 
+bool configurationWebActive() { return webActive; }
+
 ConfigurationWebMode configurationWebMode() { return selectedWebMode; }
 
 bool configurationWebSetMode(ConfigurationWebMode mode) {
   if (mode > CONFIGURATION_WEB_DISABLED) return false;
-  if (!persistWebMode(mode)) return false;
+  if (!beginStorageTransaction()) return false;
+  const bool persisted = persistWebMode(mode);
+  const bool storageFinished = endStorageTransaction();
+  if (!persisted || !storageFinished) return false;
   applyWebMode(mode);
   return true;
 }
@@ -1550,3 +1698,5 @@ void configurationWebUnlockForTest() {
   if (selectedWebMode != CONFIGURATION_WEB_DISABLED)
     unlockConfiguration(true);
 }
+
+#undef server
