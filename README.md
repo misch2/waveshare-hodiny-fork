@@ -1,3 +1,9 @@
+# Toto je jen fork
+
+Skutečný repozitář je zde: https://github.com/CooLajz/waveshare-hodiny
+
+Tento fork slouží jen k tomu abych mohl https://github.com/CooLajz/waveshare-hodiny snadno integrovat dohromady s dalšími moduly.
+
 # Waveshare Hodiny
 
 Český informační dashboard pro kulatý dotykový displej
