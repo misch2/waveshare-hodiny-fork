@@ -194,6 +194,7 @@ SettingsOpenCallback settingsOpenCallback = nullptr;
 SettingsSaveCallback settingsSaveCallback = nullptr;
 SettingsActionCallback firmwareCheckCallback = nullptr;
 SettingsActionCallback firmwareInstallCallback = nullptr;
+ShortClickAllowedCallback shortClickAllowedCallback = nullptr;
 
 bool redNightVisualEnabled() {
   return nightModeEnabled && nightVisualMode == CLOCK_NIGHT_VISUAL_RED;
@@ -907,6 +908,8 @@ void applyDashboardColors() {
 void toggleNightModeEvent(lv_event_t *event) {
   if (lv_event_get_code(event) != LV_EVENT_SHORT_CLICKED || settingsVisible ||
       automaticDayNightEnabled)
+    return;
+  if (shortClickAllowedCallback != nullptr && !shortClickAllowedCallback())
     return;
   clockDashboardSetNightMode(!nightModeEnabled);
 }
@@ -1846,6 +1849,11 @@ void clockDashboardLoop() {
   lastSecondFadeFrameAt = now;
   if (secondFadeActive || smoothSecondEffectActive) renderSecondRing(now);
   if (smoothTimeColonActive) renderTimeColon(now);
+}
+
+void clockDashboardSetShortClickAllowedCallback(
+    ShortClickAllowedCallback callback) {
+  shortClickAllowedCallback = callback;
 }
 
 void clockDashboardShowSettings() {

@@ -31,6 +31,7 @@ using SettingsSaveCallback = void (*)(uint8_t dayBrightness,
                                       bool automaticFirmwareUpdate,
                                       uint8_t webMode);
 using SettingsActionCallback = void (*)();
+using ShortClickAllowedCallback = bool (*)();
 
 void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
                         uint8_t nightBrightness, bool automaticDayNight,
@@ -40,6 +41,10 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
                         SettingsActionCallback firmwareCheck,
                         SettingsActionCallback firmwareInstall);
 void clockDashboardLoop();
+// Optional integration filter for the dashboard's manual day/night short
+// click. A null callback preserves the standalone firmware behavior.
+void clockDashboardSetShortClickAllowedCallback(
+    ShortClickAllowedCallback callback);
 void clockDashboardShowSettings();
 void clockDashboardShowSettingsPage(uint8_t page);
 void clockDashboardSetNightMode(bool enabled);
