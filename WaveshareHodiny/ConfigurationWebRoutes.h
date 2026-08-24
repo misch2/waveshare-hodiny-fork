@@ -20,6 +20,7 @@ struct ConfigurationWebRoutes {
   const char* apiPrefix = CONFIGURATION_WEB_DEFAULT_API_PREFIX;
   bool registerLegacyAliases = true;
   bool manageServerLifecycle = true;
+  bool firmwareUpdatesEnabled = true;
   // Supply both callbacks or neither. They bracket every runtime NVS write.
   ConfigurationStorageBeginCallback storageBegin = nullptr;
   ConfigurationStorageEndCallback storageEnd = nullptr;

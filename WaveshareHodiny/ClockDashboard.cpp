@@ -933,10 +933,12 @@ void showSettings() {
   lv_dropdown_set_selected(secondModeDropdown, selectedSecondMode());
   lv_dropdown_set_selected(weatherIconModeDropdown,
                            selectedWeatherIconMode());
-  if (automaticFirmwareUpdateEnabled)
-    lv_obj_add_state(automaticUpdateSwitch, LV_STATE_CHECKED);
-  else
-    lv_obj_clear_state(automaticUpdateSwitch, LV_STATE_CHECKED);
+  if (automaticUpdateSwitch != nullptr) {
+    if (automaticFirmwareUpdateEnabled)
+      lv_obj_add_state(automaticUpdateSwitch, LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(automaticUpdateSwitch, LV_STATE_CHECKED);
+  }
   lv_dropdown_set_selected(webModeDropdown, selectedWebMode);
   showSettingsSubpage(0);
   settingsVisible = true;
@@ -961,6 +963,7 @@ void closeSettings(bool saveChanges) {
     applySelectedWeatherIconMode(
         lv_dropdown_get_selected(weatherIconModeDropdown));
     automaticFirmwareUpdateEnabled =
+        automaticUpdateSwitch != nullptr &&
         lv_obj_has_state(automaticUpdateSwitch, LV_STATE_CHECKED);
     selectedWebMode = lv_dropdown_get_selected(webModeDropdown);
     if (settingsSaveCallback != nullptr) {
@@ -1234,30 +1237,43 @@ void createSettingsPage(lv_obj_t *screen) {
   alignCenter(deviceInfoLabel, 0, -64);
   webModeDropdown = makeSettingsDropdown(
       settingsContent[2], "WEB", "10 MINUT\nVŽDY\nVYPNUTÝ", -24, selectedWebMode);
-  automaticUpdateSwitch = makeSettingsSwitch(
-      settingsContent[2], "AUTOMATICKÉ OTA", 30, automaticFirmwareUpdateEnabled);
+  const bool firmwareControlsAvailable =
+      firmwareCheckCallback != nullptr && firmwareInstallCallback != nullptr;
+  if (firmwareControlsAvailable) {
+    automaticUpdateSwitch = makeSettingsSwitch(
+        settingsContent[2], "AUTOMATICKÉ OTA", 30,
+        automaticFirmwareUpdateEnabled);
 
-  firmwareCheckButton = lv_btn_create(settingsContent[2]);
-  lv_obj_set_size(firmwareCheckButton, 190, 42);
-  alignCenter(firmwareCheckButton, 0, 88);
-  lv_obj_set_style_radius(firmwareCheckButton, 21, 0);
-  lv_obj_set_style_bg_color(firmwareCheckButton, COLOR_HUMIDITY, 0);
-  lv_obj_add_event_cb(firmwareCheckButton, firmwareCheckEvent, LV_EVENT_SHORT_CLICKED, nullptr);
-  lv_obj_t *checkLabel = makeLabel(firmwareCheckButton, &clock_czech_16, COLOR_TEXT);
-  lv_label_set_text(checkLabel, "ZKONTROLOVAT");
-  lv_obj_center(checkLabel);
+    firmwareCheckButton = lv_btn_create(settingsContent[2]);
+    lv_obj_set_size(firmwareCheckButton, 190, 42);
+    alignCenter(firmwareCheckButton, 0, 88);
+    lv_obj_set_style_radius(firmwareCheckButton, 21, 0);
+    lv_obj_set_style_bg_color(firmwareCheckButton, COLOR_HUMIDITY, 0);
+    lv_obj_add_event_cb(firmwareCheckButton, firmwareCheckEvent,
+                        LV_EVENT_SHORT_CLICKED, nullptr);
+    lv_obj_t *checkLabel =
+        makeLabel(firmwareCheckButton, &clock_czech_16, COLOR_TEXT);
+    lv_label_set_text(checkLabel, "ZKONTROLOVAT");
+    lv_obj_center(checkLabel);
 
-  firmwareInstallButton = lv_btn_create(settingsContent[2]);
-  lv_obj_set_size(firmwareInstallButton, 190, 42);
-  alignCenter(firmwareInstallButton, 0, 88);
-  lv_obj_set_style_radius(firmwareInstallButton, 21, 0);
-  lv_obj_set_style_bg_color(firmwareInstallButton, COLOR_AIR, 0);
-  lv_obj_add_event_cb(firmwareInstallButton, firmwareInstallEvent,
-                      LV_EVENT_SHORT_CLICKED, nullptr);
-  lv_obj_t *installLabel = makeLabel(firmwareInstallButton, &clock_czech_16, COLOR_BACKGROUND);
-  lv_label_set_text(installLabel, "AKTUALIZOVAT");
-  lv_obj_center(installLabel);
-  lv_obj_add_flag(firmwareInstallButton, LV_OBJ_FLAG_HIDDEN);
+    firmwareInstallButton = lv_btn_create(settingsContent[2]);
+    lv_obj_set_size(firmwareInstallButton, 190, 42);
+    alignCenter(firmwareInstallButton, 0, 88);
+    lv_obj_set_style_radius(firmwareInstallButton, 21, 0);
+    lv_obj_set_style_bg_color(firmwareInstallButton, COLOR_AIR, 0);
+    lv_obj_add_event_cb(firmwareInstallButton, firmwareInstallEvent,
+                        LV_EVENT_SHORT_CLICKED, nullptr);
+    lv_obj_t *installLabel =
+        makeLabel(firmwareInstallButton, &clock_czech_16, COLOR_BACKGROUND);
+    lv_label_set_text(installLabel, "AKTUALIZOVAT");
+    lv_obj_center(installLabel);
+    lv_obj_add_flag(firmwareInstallButton, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    automaticUpdateSwitch = nullptr;
+    firmwareCheckButton = nullptr;
+    firmwareInstallButton = nullptr;
+    automaticFirmwareUpdateEnabled = false;
+  }
   firmwareStatusLabel = makeLabel(settingsContent[2], &clock_czech_16, COLOR_MUTED);
   lv_obj_set_width(firmwareStatusLabel, 360);
   lv_obj_set_style_text_align(firmwareStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
@@ -1563,7 +1579,9 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
       0xFFFFFF;
   rightWeatherIconColor = config.rightWeatherIconColor & 0xFFFFFF;
   animatedWeatherIconsEnabled = config.animatedWeatherIcons;
-  automaticFirmwareUpdateEnabled = config.automaticFirmwareUpdate;
+  automaticFirmwareUpdateEnabled =
+      firmwareCheckCallback != nullptr && firmwareInstallCallback != nullptr &&
+      config.automaticFirmwareUpdate;
   configuredWeatherIconStyle = constrain(
       config.weatherIconStyle,
       static_cast<uint8_t>(CLOCK_WEATHER_ICON_STYLE_MONOCHROME),
@@ -1756,6 +1774,8 @@ void clockDashboardLoop() {
       lv_label_set_text(deviceInfoLabel, displayedDeviceInfo);
       alignCenter(deviceInfoLabel, 0, -64);
     }
+    const bool firmwareControlsAvailable =
+        firmwareCheckCallback != nullptr && firmwareInstallCallback != nullptr;
     const FirmwareUpdateSnapshot snapshot = firmwareUpdateServiceSnapshot();
     char statusText[160] = "";
     switch (snapshot.state) {
@@ -1779,9 +1799,12 @@ void clockDashboardLoop() {
         strlcpy(statusText, "RESTARTUJI ZAŘÍZENÍ", sizeof(statusText));
         break;
       default:
-        strlcpy(statusText, snapshot.installationSupported
-                                ? "AKTUALIZACE NEZKONTROLOVÁNA"
-                                : "OTA JEN V RELEASE",
+        strlcpy(statusText,
+                firmwareControlsAvailable
+                    ? (snapshot.installationSupported
+                           ? "AKTUALIZACE NEZKONTROLOVÁNA"
+                           : "OTA JEN V RELEASE")
+                    : "AKTUALIZACE RUČNĚ PŘES USB",
                 sizeof(statusText));
         break;
     }
@@ -1791,12 +1814,14 @@ void clockDashboardLoop() {
       lv_label_set_text(firmwareStatusLabel, displayedFirmwareStatus);
       alignCenter(firmwareStatusLabel, 0, 123);
     }
-    const bool canInstall = snapshot.updateAvailable &&
-                            snapshot.installationSupported && !snapshot.busy;
-    if (displayedCanInstall != canInstall) {
-      displayedCanInstall = canInstall;
-      setObjectVisible(firmwareInstallButton, canInstall);
-      setObjectVisible(firmwareCheckButton, !canInstall);
+    if (firmwareControlsAvailable) {
+      const bool canInstall = snapshot.updateAvailable &&
+                              snapshot.installationSupported && !snapshot.busy;
+      if (displayedCanInstall != canInstall) {
+        displayedCanInstall = canInstall;
+        setObjectVisible(firmwareInstallButton, canInstall);
+        setObjectVisible(firmwareCheckButton, !canInstall);
+      }
     }
   }
   if (weatherAnimationRevealPending &&

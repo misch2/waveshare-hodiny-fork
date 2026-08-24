@@ -81,6 +81,7 @@ String configurationPagePath = CONFIGURATION_WEB_DEFAULT_PAGE_PATH;
 String configurationApiPrefix = CONFIGURATION_WEB_DEFAULT_API_PREFIX;
 bool legacyAliasesEnabled = true;
 bool serverLifecycleManaged = true;
+bool firmwareUpdatesEnabled = true;
 
 String normalizedPagePath(const char *path) {
   String result = path == nullptr ? String() : String(path);
@@ -887,7 +888,11 @@ void handleGetConfig() {
                 : F("red");
   result += '"';
   result += F(",\"automaticFirmwareUpdate\":");
-  result += config.automaticFirmwareUpdate ? F("true") : F("false");
+  result += firmwareUpdatesEnabled && config.automaticFirmwareUpdate
+                ? F("true")
+                : F("false");
+  result += F(",\"firmwareUpdatesEnabled\":");
+  result += firmwareUpdatesEnabled ? F("true") : F("false");
   result += F(",\"webMode\":\"");
   if (selectedWebMode == CONFIGURATION_WEB_ALWAYS)
     result += F("always");
@@ -1097,7 +1102,7 @@ void handleSaveConfig() {
     return;
   }
   config.automaticFirmwareUpdate =
-      server.arg("automaticFirmwareUpdate") == "1";
+      firmwareUpdatesEnabled && server.arg("automaticFirmwareUpdate") == "1";
   const String timeColonEffect = server.arg("timeColonEffect");
   if (timeColonEffect == "steady")
     config.timeColonEffect = CLOCK_TIME_COLON_STEADY;
@@ -1524,24 +1529,26 @@ void registerApiRoutes(const String &prefix) {
   server.on(prefix + F("/restart"), HTTP_POST, []() {
     if (requireConfigurationAccess()) handleRestart();
   });
-  server.on(prefix + F("/firmware"), HTTP_GET, []() {
-    if (requireConfigurationAccess()) handleFirmwareStatus();
-  });
-  server.on(prefix + F("/firmware/check"), HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareCheck();
-  });
-  server.on(prefix + F("/firmware/install"), HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareInstall();
-  });
-  server.on(prefix + F("/update-status"), HTTP_GET, []() {
-    if (requireConfigurationAccess()) handleFirmwareStatus();
-  });
-  server.on(prefix + F("/check-update"), HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareCheck();
-  });
-  server.on(prefix + F("/install-update"), HTTP_POST, []() {
-    if (requireConfigurationAccess()) handleFirmwareInstall();
-  });
+  if (firmwareUpdatesEnabled) {
+    server.on(prefix + F("/firmware"), HTTP_GET, []() {
+      if (requireConfigurationAccess()) handleFirmwareStatus();
+    });
+    server.on(prefix + F("/firmware/check"), HTTP_POST, []() {
+      if (requireConfigurationAccess()) handleFirmwareCheck();
+    });
+    server.on(prefix + F("/firmware/install"), HTTP_POST, []() {
+      if (requireConfigurationAccess()) handleFirmwareInstall();
+    });
+    server.on(prefix + F("/update-status"), HTTP_GET, []() {
+      if (requireConfigurationAccess()) handleFirmwareStatus();
+    });
+    server.on(prefix + F("/check-update"), HTTP_POST, []() {
+      if (requireConfigurationAccess()) handleFirmwareCheck();
+    });
+    server.on(prefix + F("/install-update"), HTTP_POST, []() {
+      if (requireConfigurationAccess()) handleFirmwareInstall();
+    });
+  }
   server.on(prefix + F("/diagnostics"), HTTP_GET, handleDiagnostics);
   server.on(prefix + F("/status"), HTTP_GET, handleDiagnostics);
   server.on(prefix + F("/runtime"), HTTP_GET, handleDiagnostics);
@@ -1651,6 +1658,7 @@ bool configurationWebBeginWithOptions(
   configurationApiPrefix = normalizedApiPrefix(options.apiPrefix);
   legacyAliasesEnabled = options.registerLegacyAliases;
   serverLifecycleManaged = options.manageServerLifecycle;
+  firmwareUpdatesEnabled = options.firmwareUpdatesEnabled;
   storageBeginCallback = options.storageBegin;
   storageEndCallback = options.storageEnd;
   initializeConfigurationWeb(
