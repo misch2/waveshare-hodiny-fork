@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
@@ -13,21 +14,50 @@
 #include <cctype>
 
 #include "ConfigurationPage.h"
+#include "ConfigurationLocalization.h"
+#include "BoundedWebServer.h"
+#include "ChmiRadarService.h"
 #include "DiagnosticPage.h"
+#include "Display_ST7701.h"
 #include "FirmwareBuild.h"
 #include "FirmwareHubCa.h"
 #include "FirmwareUpdateService.h"
 #include "HomeAssistantConnectionPolicy.h"
 #include "LoginPage.h"
+#include "NetworkCoordinator.h"
 #include "NetworkDiagnostics.h"
+#include "TmepService.h"
+
+// These standalone-only providers are weak so the combined build may disable
+// clock-local radar diagnostics without linking the standalone radar/display
+// implementation.  The standalone application still resolves both symbols.
+extern void chmiRadarServiceDiagnostics(ChmiRadarDiagnostics &diagnostics)
+    __attribute__((weak));
+extern uint32_t LCD_GetPixelClock() __attribute__((weak));
 
 namespace {
 WebServer *serverInstance = nullptr;
 WebServer &ownedServer() {
-  static WebServer instance(80);
+  static BoundedWebServer instance(80);
   return instance;
 }
 #define server (*serverInstance)
+BoundedWebServer *boundedServerInstance = nullptr;
+
+// WebServer::arg()/hasArg() are not virtual.  Keep the clock handlers
+// dispatching through the shared bounded parser whenever a bounded POST is
+// active, including when the caller supplied the host-owned server instance.
+String requestArg(const String &name) {
+  return boundedServerInstance != nullptr ? boundedServerInstance->arg(name)
+                                           : serverInstance->arg(name);
+}
+
+bool requestHasArg(const String &name) {
+  return boundedServerInstance != nullptr
+             ? boundedServerInstance->hasArg(name)
+             : serverInstance->hasArg(name);
+}
+
 ClockConfigLoadCallback configLoadCallback = nullptr;
 ClockConfigSaveCallback configSaveCallback = nullptr;
 ConfigurationWebStatusCallback webStatusCallback = nullptr;
@@ -38,17 +68,24 @@ DisplayPowerCallback currentDisplayPowerCallback = nullptr;
 DisplayPowerStatusCallback currentDisplayPowerStatusCallback = nullptr;
 ConfigurationStorageBeginCallback storageBeginCallback = nullptr;
 ConfigurationStorageEndCallback storageEndCallback = nullptr;
+RadarRangeStateCallback currentRadarRangeStateCallback = nullptr;
+RadarRangePreviewCallback currentRadarRangePreviewCallback = nullptr;
+ClockAppearanceStateCallback currentAppearanceStateCallback = nullptr;
+ClockAppearanceChangeCallback currentAppearancePreviewCallback = nullptr;
+ClockAppearanceChangeCallback currentAppearanceSaveCallback = nullptr;
 ClockConfig configBuffer;
 constexpr unsigned long WEB_AVAILABILITY_MS = 10UL * 60UL * 1000UL;
 bool webActive = false;
 unsigned long webAvailableUntil = 0;
-ConfigurationWebMode selectedWebMode = CONFIGURATION_WEB_TIMED;
+ConfigurationWebMode selectedWebMode = CONFIGURATION_WEB_ALWAYS;
 constexpr char WEB_PREFS_NAMESPACE[] = "web-mode";
 constexpr char WEB_PREFS_KEY[] = "mode";
 constexpr char CONTROL_PREFS_NAMESPACE[] = "control-api";
 constexpr char CONTROL_PREFS_KEY[] = "secret";
 constexpr size_t CONTROL_SECRET_LENGTH = 32;
 String controlSecret;
+constexpr size_t SAVE_CONFIRMATION_ID_LENGTH = 16;
+String lastSaveConfirmationId;
 constexpr char WEB_AUTH_PREFS_NAMESPACE[] = "web-auth";
 constexpr char WEB_AUTH_PREFS_KEY[] = "credential";
 constexpr uint32_t WEB_PASSWORD_MAGIC = 0x57485058;
@@ -82,6 +119,7 @@ String configurationApiPrefix = CONFIGURATION_WEB_DEFAULT_API_PREFIX;
 bool legacyAliasesEnabled = true;
 bool serverLifecycleManaged = true;
 bool firmwareUpdatesEnabled = true;
+bool radarEnabled = true;
 
 String normalizedPagePath(const char *path) {
   String result = path == nullptr ? String() : String(path);
@@ -142,6 +180,18 @@ bool validWebPasswordLength(const String &password) {
       ++characterCount;
   }
   return characterCount >= 6 && characterCount <= 20;
+}
+
+bool validSaveConfirmationId(const String &value) {
+  if (value.length() != SAVE_CONFIRMATION_ID_LENGTH) return false;
+  for (size_t index = 0; index < value.length(); ++index) {
+    const char character = value[index];
+    if (!((character >= '0' && character <= '9') ||
+          (character >= 'a' && character <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool deriveWebPassword(const String &password, const uint8_t *salt,
@@ -412,27 +462,49 @@ String htmlColor(uint32_t value) {
   return String(color);
 }
 
-String sideJson(const ClockSideConfig &side) {
+String sideJson(const ClockSideConfig &side,
+                const ClockSideValueConfig &valueConfig) {
   String result = F("{\"name\":\"");
   result += jsonEscape(side.name);
+  result += F("\",\"entityId\":\"");
+  result += jsonEscape(side.temperatureEntityId);
   result += F("\",\"temperatureEntityId\":\"");
   result += jsonEscape(side.temperatureEntityId);
   result += F("\",\"icon\":\"");
   result += jsonEscape(side.icon);
   result += F("\",\"color\":\"");
   result += htmlColor(side.color);
-  result += F("\"}");
+  result += F("\",\"custom\":");
+  result += valueConfig.custom ? F("true") : F("false");
+  result += F(",\"preset\":\"");
+  result += jsonEscape(valueConfig.preset);
+  result += F("\",\"suffix\":\"");
+  result += jsonEscape(valueConfig.suffix);
+  result += F("\",\"decimals\":");
+  result += valueConfig.decimals;
+  result += '}';
   return result;
 }
 
-String openMeteoSlotJson(const ClockOpenMeteoSlotConfig &slot) {
+String openMeteoSlotJson(const ClockOpenMeteoSlotConfig &slot,
+                         const ClockTmepSlotConfig &tmepSlot) {
   String result = F("{\"value\":\"");
   result += jsonEscape(slot.value);
   result += F("\",\"name\":\"");
   result += jsonEscape(slot.name);
   result += F("\",\"color\":\"");
   result += htmlColor(slot.color);
-  result += F("\"}");
+  result += F("\",\"source\":\"");
+  result += tmepSlot.enabled ? F("tmep") : F("open-meteo");
+  result += F("\",\"tmepSensorId\":\"");
+  result += jsonEscape(tmepSlot.sensorId);
+  result += F("\",\"tmepField\":\"");
+  result += jsonEscape(tmepSlot.field);
+  result += F("\",\"unit\":\"");
+  result += jsonEscape(tmepSlot.unit);
+  result += F("\",\"decimals\":");
+  result += tmepSlot.decimals;
+  result += '}';
   return result;
 }
 
@@ -450,6 +522,96 @@ bool validOpenMeteoValue(const String &value) {
     if (value == candidate) return true;
   }
   return false;
+}
+
+bool validTmepSensorId(const String &sensorId) {
+  if (sensorId.isEmpty() || sensorId.length() >= CLOCK_TMEP_SENSOR_ID_LENGTH)
+    return false;
+  for (size_t index = 0; index < sensorId.length(); ++index) {
+    if (!std::isdigit(static_cast<unsigned char>(sensorId[index])))
+      return false;
+  }
+  return true;
+}
+
+bool validTmepUnit(const String &unit) {
+  if (unit.isEmpty() || unit.length() >= CLOCK_TMEP_UNIT_LENGTH) return false;
+  for (size_t index = 0; index < unit.length(); ++index) {
+    if (static_cast<uint8_t>(unit[index]) < 0x20) return false;
+  }
+  return true;
+}
+
+int hexDigit(char character) {
+  if (character >= '0' && character <= '9') return character - '0';
+  if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+  if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+  return -1;
+}
+
+bool decodeQueryValue(const String &input, String &output) {
+  output = "";
+  output.reserve(input.length());
+  for (size_t index = 0; index < input.length(); ++index) {
+    const char character = input[index];
+    if (character == '+') {
+      output += ' ';
+      continue;
+    }
+    if (character != '%') {
+      output += character;
+      continue;
+    }
+    if (index + 2 >= input.length()) return false;
+    const int high = hexDigit(input[index + 1]);
+    const int low = hexDigit(input[index + 2]);
+    if (high < 0 || low < 0) return false;
+    output += static_cast<char>((high << 4) | low);
+    index += 2;
+  }
+  return true;
+}
+
+bool parseTmepExportUrl(const String &url, String &exportId,
+                        String &exportKey) {
+  String normalized = url;
+  normalized.trim();
+  static const char TMEP_PREFIX[] = "https://tmep.cz/";
+  static const char TMEP_WWW_PREFIX[] = "https://www.tmep.cz/";
+  if ((!normalized.startsWith(TMEP_PREFIX) &&
+       !normalized.startsWith(TMEP_WWW_PREFIX)) ||
+      normalized.indexOf('#') >= 0)
+    return false;
+  const int queryStart = normalized.indexOf('?');
+  if (queryStart < 0) return false;
+  exportId = "";
+  exportKey = "";
+  const String query = normalized.substring(queryStart + 1);
+  int position = 0;
+  while (position <= static_cast<int>(query.length())) {
+    int end = query.indexOf('&', position);
+    if (end < 0) end = query.length();
+    const String item = query.substring(position, end);
+    const int separator = item.indexOf('=');
+    if (separator > 0) {
+      String name;
+      String value;
+      if (!decodeQueryValue(item.substring(0, separator), name) ||
+          !decodeQueryValue(item.substring(separator + 1), value))
+        return false;
+      if (name == "id") exportId = value;
+      if (name == "export_key") exportKey = value;
+    }
+    if (end >= static_cast<int>(query.length())) break;
+    position = end + 1;
+  }
+  if (!validTmepSensorId(exportId) || exportKey.isEmpty() ||
+      exportKey.length() >= CLOCK_TMEP_EXPORT_KEY_LENGTH)
+    return false;
+  for (size_t index = 0; index < exportKey.length(); ++index) {
+    if (static_cast<uint8_t>(exportKey[index]) < 0x20) return false;
+  }
+  return true;
 }
 
 String urlEncode(const String &value) {
@@ -493,8 +655,8 @@ void addSecurityHeaders() {
   server.sendHeader(F("X-Frame-Options"), F("DENY"));
   server.sendHeader(
       F("Content-Security-Policy"),
-      F("default-src 'self'; style-src 'unsafe-inline'; script-src "
-        "'unsafe-inline'; connect-src 'self'; form-action 'self'; "
+      F("default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src "
+        "'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
         "frame-ancestors 'none'"));
 }
 
@@ -510,9 +672,206 @@ void sendError(int status, const __FlashStringHelper *message) {
   sendJson(status, payload);
 }
 
+void sendError(int status, const String &message) {
+  String payload = F("{\"ok\":false,\"message\":\"");
+  payload += jsonEscape(message.c_str());
+  payload += F("\"}");
+  sendJson(status, payload);
+}
+
 ClockConfig &currentConfig() {
   if (configLoadCallback != nullptr) configLoadCallback(configBuffer);
   return configBuffer;
+}
+
+uint8_t browserLanguage() {
+  String language = server.header("Accept-Language");
+  language.trim();
+  const int comma = language.indexOf(',');
+  if (comma >= 0) language.remove(comma);
+  const int quality = language.indexOf(';');
+  if (quality >= 0) language.remove(quality);
+  language.trim();
+  language.toLowerCase();
+  const bool czechOrSlovak =
+      language == "cs" || language.startsWith("cs-") ||
+      language.startsWith("cs_") || language == "sk" ||
+      language.startsWith("sk-") || language.startsWith("sk_");
+  return czechOrSlovak ? CLOCK_LANGUAGE_CZECH : CLOCK_LANGUAGE_ENGLISH;
+}
+
+void persistBrowserLanguageIfUnset() {
+  ClockConfig &config = currentConfig();
+  if (config.language != CLOCK_LANGUAGE_UNSET) return;
+  config.language = browserLanguage();
+  config.schemaVersion = CLOCK_CONFIG_SCHEMA_VERSION;
+  if (!beginStorageTransaction()) {
+    config.language = CLOCK_LANGUAGE_UNSET;
+    return;
+  }
+  const bool saved = configSaveCallback != nullptr &&
+                     configSaveCallback(config, false);
+  const bool storageFinished = endStorageTransaction();
+  if (!saved || !storageFinished) {
+    config.language = CLOCK_LANGUAGE_UNSET;
+  }
+}
+
+bool validRadarRadius(int radiusKm) {
+  return radiusKm == 0 || radiusKm == 25 || radiusKm == 50 ||
+         radiusKm == 100 || radiusKm == 200;
+}
+
+bool parseHtmlColor(const String &value, uint32_t &color);
+
+bool parseDateFormat(const String &value, uint8_t &format) {
+  if (value == "weekday-day-month")
+    format = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH;
+  else if (value == "numeric")
+    format = CLOCK_DATE_FORMAT_NUMERIC;
+  else if (value == "day-month-year")
+    format = CLOCK_DATE_FORMAT_DAY_MONTH_YEAR;
+  else if (value == "weekday-day-month-year")
+    format = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR;
+  else if (value == "day-month")
+    format = CLOCK_DATE_FORMAT_DAY_MONTH;
+  else if (value == "hidden")
+    format = CLOCK_DATE_FORMAT_HIDDEN;
+  else
+    return false;
+  return true;
+}
+
+const __FlashStringHelper *dateFormatName(uint8_t format) {
+  if (format == CLOCK_DATE_FORMAT_NUMERIC) return F("numeric");
+  if (format == CLOCK_DATE_FORMAT_DAY_MONTH_YEAR)
+    return F("day-month-year");
+  if (format == CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR)
+    return F("weekday-day-month-year");
+  if (format == CLOCK_DATE_FORMAT_DAY_MONTH) return F("day-month");
+  if (format == CLOCK_DATE_FORMAT_HIDDEN) return F("hidden");
+  return F("weekday-day-month");
+}
+
+void radarRangeState(uint16_t &savedRadiusKm, uint16_t &activeRadiusKm) {
+  savedRadiusKm = currentConfig().radarRadiusKm;
+  activeRadiusKm = savedRadiusKm;
+  if (currentRadarRangeStateCallback != nullptr)
+    currentRadarRangeStateCallback(savedRadiusKm, activeRadiusKm);
+}
+
+bool readAppearanceFromRequest(ClockAppearanceConfig &appearance) {
+  const String style = requestArg("clockStyle");
+  if (style == "digital")
+    appearance.style = CLOCK_STYLE_DIGITAL;
+  else if (style == "analog")
+    appearance.style = CLOCK_STYLE_ANALOG;
+  else
+    return false;
+  if (!parseHtmlColor(requestArg("analogToneColor"),
+                      appearance.analogToneColor))
+    return false;
+  if (requestHasArg("analogHandToneColor")) {
+    if (!parseHtmlColor(requestArg("analogHandToneColor"),
+                        appearance.analogHandToneColor))
+      return false;
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogHandToneColor = active.analogHandToneColor;
+  } else {
+    appearance.analogHandToneColor = appearance.analogToneColor;
+  }
+  if (requestHasArg("analogCardinalAccentColor")) {
+    if (!parseHtmlColor(requestArg("analogCardinalAccentColor"),
+                        appearance.analogCardinalAccentColor))
+      return false;
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogCardinalAccentColor =
+        active.analogCardinalAccentColor;
+  }
+  const String accents = requestArg("analogCardinalAccentsEnabled");
+  if (accents != "0" && accents != "1") return false;
+  appearance.analogCardinalAccentsEnabled = accents == "1";
+  if (requestHasArg("analogOutlineHandsEnabled")) {
+    const String outlineHands = requestArg("analogOutlineHandsEnabled");
+    if (outlineHands != "0" && outlineHands != "1") return false;
+    appearance.analogOutlineHandsEnabled = outlineHands == "1";
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogOutlineHandsEnabled =
+        active.analogOutlineHandsEnabled;
+  }
+  if (requestHasArg("analogMonochromeValuesEnabled")) {
+    const String monochromeValues =
+        requestArg("analogMonochromeValuesEnabled");
+    if (monochromeValues != "0" && monochromeValues != "1") return false;
+    appearance.analogMonochromeValuesEnabled = monochromeValues == "1";
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogMonochromeValuesEnabled =
+        active.analogMonochromeValuesEnabled;
+  }
+  if (requestHasArg("analogValuesAboveHandsEnabled")) {
+    const String valuesAboveHands =
+        requestArg("analogValuesAboveHandsEnabled");
+    if (valuesAboveHands != "0" && valuesAboveHands != "1") return false;
+    appearance.analogValuesAboveHandsEnabled = valuesAboveHands == "1";
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogValuesAboveHandsEnabled =
+        active.analogValuesAboveHandsEnabled;
+  }
+  if (requestHasArg("analogDateFormat")) {
+    if (!parseDateFormat(requestArg("analogDateFormat"),
+                         appearance.analogDateFormat))
+      return false;
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogDateFormat = active.analogDateFormat;
+  }
+  if (requestHasArg("analogDateColor")) {
+    if (!parseHtmlColor(requestArg("analogDateColor"),
+                        appearance.analogDateColor))
+      return false;
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.analogDateColor = active.analogDateColor;
+  }
+  if (requestHasArg("monochromeWeatherIconColor")) {
+    if (!parseHtmlColor(requestArg("monochromeWeatherIconColor"),
+                        appearance.monochromeWeatherIconColor))
+      return false;
+  } else if (currentAppearanceStateCallback != nullptr) {
+    ClockAppearanceConfig saved;
+    ClockAppearanceConfig active;
+    currentAppearanceStateCallback(saved, active);
+    appearance.monochromeWeatherIconColor =
+        active.monochromeWeatherIconColor;
+  }
+  return true;
+}
+
+void appearanceState(ClockAppearanceConfig &saved,
+                     ClockAppearanceConfig &active) {
+  saved = ClockAppearanceConfig{};
+  active = saved;
+  if (currentAppearanceStateCallback != nullptr)
+    currentAppearanceStateCallback(saved, active);
 }
 
 String normalizedUrl(String url) {
@@ -554,7 +913,7 @@ bool parseFiniteFloat(const String &text, float &value) {
 
 bool readColorScaleFromForm(const char *prefix, ClockMetricColorScale &scale) {
   const String fieldPrefix(prefix);
-  const int count = server.arg(fieldPrefix + "Count").toInt();
+  const int count = requestArg(fieldPrefix + "Count").toInt();
   if (count < 1 || count > static_cast<int>(CLOCK_METRIC_COLOR_POINT_COUNT)) {
     return false;
   }
@@ -562,9 +921,9 @@ bool readColorScaleFromForm(const char *prefix, ClockMetricColorScale &scale) {
   scale.count = static_cast<uint8_t>(count);
   for (uint8_t index = 0; index < scale.count; ++index) {
     const String suffix = String(index);
-    if (!parseFiniteFloat(server.arg(fieldPrefix + "Value" + suffix),
+    if (!parseFiniteFloat(requestArg(fieldPrefix + "Value" + suffix),
                           scale.points[index].value) ||
-        !parseHtmlColor(server.arg(fieldPrefix + "Color" + suffix),
+        !parseHtmlColor(requestArg(fieldPrefix + "Color" + suffix),
                         scale.points[index].color)) {
       return false;
     }
@@ -594,6 +953,7 @@ void applyPreset(ClockMetricConfig &metric, const String &preset) {
     uint8_t decimals;
   };
   static const Preset presets[] = {
+      {"temperature", "TEPLOTA", "°C", 1},
       {"co2", "CO₂", "ppm", 0},       {"voc", "VOC", "ppb", 0},
       {"pm25", "PM2.5", "µg/m³", 0}, {"pm10", "PM10", "µg/m³", 0},
       {"humidity", "VLHKOST", "%", 0}, {"pressure", "TLAK", "hPa", 0},
@@ -615,33 +975,51 @@ void applyPreset(ClockMetricConfig &metric, const String &preset) {
 
 void readMetricFromForm(const char *prefix, ClockMetricConfig &metric) {
   const String fieldPrefix(prefix);
-  metric.custom = server.arg(fieldPrefix + "Mode") == "custom";
+  metric.custom = requestArg(fieldPrefix + "Mode") == "custom";
   clockConfigCopy(metric.entityId, sizeof(metric.entityId),
-                  server.arg(fieldPrefix + "Entity"));
+                  requestArg(fieldPrefix + "Entity"));
   if (metric.custom) {
     clockConfigCopy(metric.preset, sizeof(metric.preset), "custom");
     clockConfigCopy(metric.name, sizeof(metric.name),
-                    server.arg(fieldPrefix + "Name"));
+                    requestArg(fieldPrefix + "Name"));
     clockConfigCopy(metric.suffix, sizeof(metric.suffix),
-                    server.arg(fieldPrefix + "Suffix"));
+                    requestArg(fieldPrefix + "Suffix"));
   } else {
-    applyPreset(metric, server.arg(fieldPrefix + "Preset"));
+    applyPreset(metric, requestArg(fieldPrefix + "Preset"));
   }
   metric.decimals =
-      constrain(server.arg(fieldPrefix + "Decimals").toInt(), 0, 2);
+      constrain(requestArg(fieldPrefix + "Decimals").toInt(), 0, 2);
 }
 
-bool readSideFromForm(const char *prefix, ClockSideConfig &side) {
+void readSideFromForm(const char *prefix, ClockSideConfig &side,
+                      ClockSideValueConfig &valueConfig) {
   const String fieldPrefix(prefix);
-  clockConfigCopy(side.name, sizeof(side.name), server.arg(fieldPrefix + "Name"));
-  if (side.name[0] == '\0') {
-    clockConfigCopy(side.name, sizeof(side.name), "MÍSTNOST");
+  valueConfig.custom = requestArg(fieldPrefix + "Mode") == "custom";
+  clockConfigCopy(side.temperatureEntityId,
+                  sizeof(side.temperatureEntityId),
+                  requestArg(fieldPrefix + "Entity"));
+  if (valueConfig.custom) {
+    clockConfigCopy(valueConfig.preset, sizeof(valueConfig.preset), "custom");
+    clockConfigCopy(side.name, sizeof(side.name),
+                    requestArg(fieldPrefix + "Name"));
+    clockConfigCopy(valueConfig.suffix, sizeof(valueConfig.suffix),
+                    requestArg(fieldPrefix + "Suffix"));
+  } else {
+    ClockMetricConfig presetConfig;
+    applyPreset(presetConfig, requestArg(fieldPrefix + "Preset"));
+    clockConfigCopy(valueConfig.preset, sizeof(valueConfig.preset),
+                    presetConfig.preset);
+    clockConfigCopy(side.name, sizeof(side.name), presetConfig.name);
+    clockConfigCopy(valueConfig.suffix, sizeof(valueConfig.suffix),
+                    presetConfig.suffix);
   }
-  clockConfigCopy(side.temperatureEntityId, sizeof(side.temperatureEntityId),
-                  server.arg(fieldPrefix + "TemperatureEntity"));
+  if (side.name[0] == '\0') {
+    clockConfigCopy(side.name, sizeof(side.name), "HODNOTA");
+  }
+  valueConfig.decimals =
+      constrain(requestArg(fieldPrefix + "Decimals").toInt(), 0, 2);
   clockConfigCopy(side.icon, sizeof(side.icon),
-                  normalizedRoomIcon(server.arg(fieldPrefix + "Icon")));
-  return parseHtmlColor(server.arg(fieldPrefix + "Color"), side.color);
+                  normalizedRoomIcon(requestArg(fieldPrefix + "Icon")));
 }
 
 template <typename Client>
@@ -673,8 +1051,8 @@ int testHomeAssistant(Client &client, const String &url, const String &token,
 
 void resolveConnectionInput(String &url, String &token) {
   const ClockConfig &config = currentConfig();
-  url = normalizedUrl(server.arg("haUrl"));
-  token = server.arg("haToken");
+  url = normalizedUrl(requestArg("haUrl"));
+  token = requestArg("haToken");
   const String storedUrl = normalizedUrl(config.homeAssistantUrl);
   if (token.isEmpty() &&
       homeAssistantMayReuseStoredToken(url.c_str(), storedUrl.c_str())) {
@@ -684,6 +1062,7 @@ void resolveConnectionInput(String &url, String &token) {
 }
 
 void handleRoot() {
+  persistBrowserLanguageIfUnset();
   addSecurityHeaders();
   if (webActive) {
     extendWebAvailability();
@@ -694,6 +1073,12 @@ void handleRoot() {
   } else {
     server.send_P(200, PSTR("text/html; charset=utf-8"), DIAGNOSTIC_PAGE);
   }
+}
+
+void handleDiagnosticPage() {
+  persistBrowserLanguageIfUnset();
+  addSecurityHeaders();
+  server.send_P(200, PSTR("text/html; charset=utf-8"), DIAGNOSTIC_PAGE);
 }
 
 bool requestOriginAllowed() {
@@ -737,7 +1122,7 @@ void handleWebLogin() {
     sendError(429, F("Příliš mnoho pokusů. Zkus to za chvíli znovu."));
     return;
   }
-  if (!webPasswordMatches(server.arg("password"))) {
+  if (!webPasswordMatches(requestArg("password"))) {
     if (failedLoginAttempts < 8) ++failedLoginAttempts;
     const uint8_t exponent = failedLoginAttempts > 5
                                  ? 4
@@ -753,7 +1138,7 @@ void handleWebLogin() {
 }
 
 void handleWebPassword() {
-  const String action = server.arg("action");
+  const String action = requestArg("action");
   if (action == "clear") {
     if (!webPasswordEnabled) {
       sendError(409, F("Ochrana heslem už je vypnutá."));
@@ -784,7 +1169,7 @@ void handleWebPassword() {
                        : F("Heslo zatím není nastavené. Použij Nastavit."));
     return;
   }
-  const String password = server.arg("password");
+  const String password = requestArg("password");
   if (!validWebPasswordLength(password)) {
     sendError(400, F("Heslo musí mít 6 až 20 znaků."));
     return;
@@ -807,28 +1192,120 @@ void handleWebPassword() {
 void handleGetConfig() {
   extendWebAvailability();
   const ClockConfig &config = currentConfig();
+  uint16_t savedRadarRadiusKm = config.radarRadiusKm;
+  uint16_t activeRadarRadiusKm = config.radarRadiusKm;
+  radarRangeState(savedRadarRadiusKm, activeRadarRadiusKm);
+  ClockAppearanceConfig savedAppearance;
+  ClockAppearanceConfig activeAppearance;
+  appearanceState(savedAppearance, activeAppearance);
   String result;
-  result.reserve(3000);
+  result.reserve(5000);
   result = F("{\"ok\":true,\"homeAssistantUrl\":\"");
   result += jsonEscape(config.homeAssistantUrl);
+  result += F("\",\"saveConfirmationId\":\"");
+  result += lastSaveConfirmationId;
   result += F("\",\"tokenConfigured\":");
   result += config.homeAssistantToken[0] == '\0' ? F("false") : F("true");
+  result += F(",\"tmepKeyConfigured\":");
+  result += config.tmepExportId[0] == '\0' || config.tmepExportKey[0] == '\0'
+                ? F("false")
+                : F("true");
   result += F(",\"webPasswordConfigured\":");
   result += webPasswordEnabled ? F("true") : F("false");
   result += F(",\"dataSource\":\"");
   result += config.dataSource == CLOCK_DATA_SOURCE_HOME_ASSISTANT
                 ? F("home-assistant")
                 : F("open-meteo");
+  result += F("\",\"language\":\"");
+  result += config.language == CLOCK_LANGUAGE_ENGLISH ? F("en") : F("cs");
   result += F("\",\"openMeteoCity\":\"");
   result += jsonEscape(config.openMeteoCity);
   result += F("\",\"openMeteoLatitude\":");
   result += String(config.openMeteoLatitude, 5);
   result += F(",\"openMeteoLongitude\":");
   result += String(config.openMeteoLongitude, 5);
+  result += F(",\"openMeteoCountry\":\"");
+  result += clockConfigRadarAvailable(config) ? F("CZ") : F("OTHER");
+  result += F("\",\"radarAvailable\":");
+  result += radarEnabled && clockConfigRadarAvailable(config) ? F("true") : F("false");
+  result += F(",\"radarEnabled\":");
+  result += radarEnabled ? F("true") : F("false");
+  result += F(",\"radarRadiusKm\":");
+  result += savedRadarRadiusKm;
+  result += F(",\"radarActiveRadiusKm\":");
+  result += activeRadarRadiusKm;
+  result += F(",\"radarFrameCount\":");
+  result += config.radarFrameCount;
+  result += F(",\"radarMapOpacity\":");
+  result += config.radarMapOpacity;
+  result += F(",\"radarPauseSeconds\":");
+  result += config.radarPauseSeconds;
+  result += F(",\"automaticRadarRotation\":");
+  result += config.automaticRadarRotation ? F("true") : F("false");
+  result += F(",\"clockDisplaySeconds\":");
+  result += config.clockDisplaySeconds;
+  result += F(",\"radarDisplaySeconds\":");
+  result += config.radarDisplaySeconds;
+  result += F(",\"clockStyle\":\"");
+  result += savedAppearance.style == CLOCK_STYLE_ANALOG ? F("analog")
+                                                        : F("digital");
+  result += F("\",\"activeClockStyle\":\"");
+  result += activeAppearance.style == CLOCK_STYLE_ANALOG ? F("analog")
+                                                         : F("digital");
+  result += F("\",\"analogToneColor\":\"");
+  result += htmlColor(savedAppearance.analogToneColor);
+  result += F("\",\"activeAnalogToneColor\":\"");
+  result += htmlColor(activeAppearance.analogToneColor);
+  result += F("\",\"analogHandToneColor\":\"");
+  result += htmlColor(savedAppearance.analogHandToneColor);
+  result += F("\",\"activeAnalogHandToneColor\":\"");
+  result += htmlColor(activeAppearance.analogHandToneColor);
+  result += F("\",\"analogCardinalAccentColor\":\"");
+  result += htmlColor(savedAppearance.analogCardinalAccentColor);
+  result += F("\",\"activeAnalogCardinalAccentColor\":\"");
+  result += htmlColor(activeAppearance.analogCardinalAccentColor);
+  result += F("\",\"analogDateFormat\":\"");
+  result += dateFormatName(savedAppearance.analogDateFormat);
+  result += F("\",\"activeAnalogDateFormat\":\"");
+  result += dateFormatName(activeAppearance.analogDateFormat);
+  result += F("\",\"analogDateColor\":\"");
+  result += htmlColor(savedAppearance.analogDateColor);
+  result += F("\",\"activeAnalogDateColor\":\"");
+  result += htmlColor(activeAppearance.analogDateColor);
+  result += F("\",\"analogCardinalAccentsEnabled\":");
+  result += savedAppearance.analogCardinalAccentsEnabled ? F("true")
+                                                         : F("false");
+  result += F(",\"activeAnalogCardinalAccentsEnabled\":");
+  result += activeAppearance.analogCardinalAccentsEnabled ? F("true")
+                                                          : F("false");
+  result += F(",\"analogOutlineHandsEnabled\":");
+  result += savedAppearance.analogOutlineHandsEnabled ? F("true")
+                                                       : F("false");
+  result += F(",\"activeAnalogOutlineHandsEnabled\":");
+  result += activeAppearance.analogOutlineHandsEnabled ? F("true")
+                                                        : F("false");
+  result += F(",\"analogMonochromeValuesEnabled\":");
+  result += savedAppearance.analogMonochromeValuesEnabled ? F("true")
+                                                           : F("false");
+  result += F(",\"activeAnalogMonochromeValuesEnabled\":");
+  result += activeAppearance.analogMonochromeValuesEnabled ? F("true")
+                                                            : F("false");
+  result += F(",\"analogValuesAboveHandsEnabled\":");
+  result += savedAppearance.analogValuesAboveHandsEnabled ? F("true")
+                                                           : F("false");
+  result += F(",\"activeAnalogValuesAboveHandsEnabled\":");
+  result += activeAppearance.analogValuesAboveHandsEnabled ? F("true")
+                                                            : F("false");
+  result += F(",\"monochromeWeatherIconColor\":\"");
+  result += htmlColor(savedAppearance.monochromeWeatherIconColor);
+  result += F("\",\"activeMonochromeWeatherIconColor\":\"");
+  result += htmlColor(activeAppearance.monochromeWeatherIconColor);
+  result += '"';
   result += F(",\"openMeteoSlots\":[");
   for (size_t index = 0; index < 4; ++index) {
     if (index > 0) result += ',';
-    result += openMeteoSlotJson(config.openMeteoSlots[index]);
+    result += openMeteoSlotJson(config.openMeteoSlots[index],
+                                config.tmepSlots[index]);
   }
   result += ']';
   result += F(",\"controlSecret\":\"");
@@ -865,9 +1342,9 @@ void handleGetConfig() {
   }
   result += '"';
   result += F(",\"leftSide\":");
-  result += sideJson(config.leftSide);
+  result += sideJson(config.leftSide, config.leftValue);
   result += F(",\"rightSide\":");
-  result += sideJson(config.rightSide);
+  result += sideJson(config.rightSide, config.rightValue);
   result += F(",\"metricA\":");
   result += metricJson(config.metricA);
   result += F(",\"metricB\":");
@@ -876,6 +1353,10 @@ void handleGetConfig() {
   result += colorScaleJson(config.metricAColorScale);
   result += F(",\"metricBColorScale\":");
   result += colorScaleJson(config.metricBColorScale);
+  result += F(",\"leftValueColorScale\":");
+  result += colorScaleJson(config.leftValueColorScale);
+  result += F(",\"rightValueColorScale\":");
+  result += colorScaleJson(config.rightValueColorScale);
   result += F(",\"dayBrightness\":");
   result += config.dayBrightness;
   result += F(",\"nightBrightness\":");
@@ -929,6 +1410,8 @@ void handleGetConfig() {
     result += F("day-month-year");
   else if (config.dateFormat == CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR)
     result += F("weekday-day-month-year");
+  else if (config.dateFormat == CLOCK_DATE_FORMAT_DAY_MONTH)
+    result += F("day-month");
   else if (config.dateFormat == CLOCK_DATE_FORMAT_HIDDEN)
     result += F("hidden");
   else
@@ -971,7 +1454,22 @@ void handleGetConfig() {
 
 void handleSaveConfig() {
   ClockConfig &config = currentConfig();
-  const String dataSource = server.arg("dataSource");
+  const String saveConfirmationId = requestArg("saveConfirmationId");
+  if (!saveConfirmationId.isEmpty() &&
+      !validSaveConfirmationId(saveConfirmationId)) {
+    sendError(400, F("Identifikátor uložení není platný."));
+    return;
+  }
+  const String language = requestArg("language");
+  if (language == "cs")
+    config.language = CLOCK_LANGUAGE_CZECH;
+  else if (language == "en")
+    config.language = CLOCK_LANGUAGE_ENGLISH;
+  else {
+    sendError(400, F("Jazyk není platný."));
+    return;
+  }
+  const String dataSource = requestArg("dataSource");
   if (dataSource == "open-meteo")
     config.dataSource = CLOCK_DATA_SOURCE_OPEN_METEO;
   else if (dataSource == "home-assistant")
@@ -980,38 +1478,133 @@ void handleSaveConfig() {
     sendError(400, F("Zdroj dat není platný."));
     return;
   }
-  String openMeteoCity = server.arg("openMeteoCity");
+  String openMeteoCity = requestArg("openMeteoCity");
   openMeteoCity.trim();
   float openMeteoLatitude = 0;
   float openMeteoLongitude = 0;
   if (openMeteoCity.isEmpty() ||
-      !parseFiniteFloat(server.arg("openMeteoLatitude"), openMeteoLatitude) ||
-      !parseFiniteFloat(server.arg("openMeteoLongitude"), openMeteoLongitude) ||
+      !parseFiniteFloat(requestArg("openMeteoLatitude"), openMeteoLatitude) ||
+      !parseFiniteFloat(requestArg("openMeteoLongitude"), openMeteoLongitude) ||
       openMeteoLatitude < -90 || openMeteoLatitude > 90 ||
       openMeteoLongitude < -180 || openMeteoLongitude > 180) {
-    sendError(400, F("Nejprve vyhledej platné město pro Open-Meteo."));
+    sendError(400, F("Nejprve vyhledej platnou polohu zařízení."));
     return;
   }
   clockConfigCopy(config.openMeteoCity, sizeof(config.openMeteoCity),
                   openMeteoCity);
   config.openMeteoLatitude = openMeteoLatitude;
   config.openMeteoLongitude = openMeteoLongitude;
+  String openMeteoCountry = requestArg("openMeteoCountry");
+  openMeteoCountry.trim();
+  openMeteoCountry.toUpperCase();
+  if (openMeteoCountry == "CZ")
+    config.openMeteoCountry = CLOCK_LOCATION_COUNTRY_CZECHIA;
+  else if (openMeteoCountry == "OTHER" || openMeteoCountry.length() == 2)
+    config.openMeteoCountry = CLOCK_LOCATION_COUNTRY_OTHER;
+  else {
+    sendError(400, F("Nejprve vyhledej platnou polohu zařízení."));
+    return;
+  }
+  if (radarEnabled) {
+    const int radarRadiusKm = requestArg("radarRadiusKm").toInt();
+    if (!validRadarRadius(radarRadiusKm)) {
+      sendError(400, F("Rozsah meteoradaru není platný."));
+      return;
+    }
+    config.radarRadiusKm = static_cast<uint16_t>(radarRadiusKm);
+    const int radarFrameCount = requestArg("radarFrameCount").toInt();
+    if (radarFrameCount < 1 || radarFrameCount > 15) {
+      sendError(400, F("Počet snímků meteoradaru musí být od 1 do 15."));
+      return;
+    }
+    config.radarFrameCount = static_cast<uint8_t>(radarFrameCount);
+    const int radarMapOpacity = requestArg("radarMapOpacity").toInt();
+    if (radarMapOpacity < 0 || radarMapOpacity > 100) {
+      sendError(400, F("Viditelnost mapy meteoradaru musí být od 0 do 100 %."));
+      return;
+    }
+    config.radarMapOpacity = static_cast<uint8_t>(radarMapOpacity);
+    const int radarPauseSeconds = requestArg("radarPauseSeconds").toInt();
+    if (radarPauseSeconds < 0 || radarPauseSeconds > 30) {
+      sendError(400, F("Pauza animace meteoradaru musí být od 0 do 30 sekund."));
+      return;
+    }
+    config.radarPauseSeconds = static_cast<uint8_t>(radarPauseSeconds);
+    const int clockDisplaySeconds = requestArg("clockDisplaySeconds").toInt();
+    const int radarDisplaySeconds = requestArg("radarDisplaySeconds").toInt();
+    if (clockDisplaySeconds < 10 || clockDisplaySeconds > 3600 ||
+        radarDisplaySeconds < 10 || radarDisplaySeconds > 3600) {
+      sendError(400, F("Časy automatického střídání musí být od 10 do 3600 sekund."));
+      return;
+    }
+    config.automaticRadarRotation =
+        clockConfigRadarAvailable(config) &&
+        requestArg("automaticRadarRotation") == "1";
+    config.clockDisplaySeconds = static_cast<uint16_t>(clockDisplaySeconds);
+    config.radarDisplaySeconds = static_cast<uint16_t>(radarDisplaySeconds);
+  }
+  const String submittedTmepUrl = requestArg("tmepExportUrl");
+  if (!submittedTmepUrl.isEmpty()) {
+    String exportId;
+    String exportKey;
+    if (!parseTmepExportUrl(submittedTmepUrl, exportId, exportKey)) {
+      sendError(400, F("Exportní URL TMEP není platná."));
+      return;
+    }
+    clockConfigCopy(config.tmepExportKey, sizeof(config.tmepExportKey),
+                    exportKey);
+    clockConfigCopy(config.tmepExportId, sizeof(config.tmepExportId),
+                    exportId);
+  }
   for (size_t index = 0; index < 4; ++index) {
     const String prefix = String(F("openMeteoSlot")) + index;
-    const String value = server.arg(prefix + F("Value"));
-    if (!validOpenMeteoValue(value) ||
-        !parseHtmlColor(server.arg(prefix + F("Color")),
+    const String value = requestArg(prefix + F("Value"));
+    const String decimalsText = requestArg(prefix + F("Decimals"));
+    if (decimalsText != F("0") && decimalsText != F("1") &&
+        decimalsText != F("2")) {
+      sendError(400, F("Počet desetinných míst musí být od 0 do 2."));
+      return;
+    }
+    const uint8_t decimals = static_cast<uint8_t>(decimalsText.toInt());
+    if (!parseHtmlColor(requestArg(prefix + F("Color")),
                         config.openMeteoSlots[index].color)) {
       sendError(400, F("Nastavení pozice Open-Meteo není platné."));
       return;
     }
-    clockConfigCopy(config.openMeteoSlots[index].value,
-                    sizeof(config.openMeteoSlots[index].value), value);
+    if (value.startsWith("tmep:")) {
+      const int separator = value.indexOf(':', 5);
+      const String sensorId =
+          separator > 5 ? value.substring(5, separator) : String();
+      const String field =
+          separator > 5 ? value.substring(separator + 1) : String();
+      const String unit = requestArg(prefix + F("Unit"));
+      if (config.tmepExportId[0] == '\0' || config.tmepExportKey[0] == '\0' ||
+          !validTmepSensorId(sensorId) ||
+          !tmepFieldSupported(field.c_str()) || !validTmepUnit(unit)) {
+        sendError(400, F("Nastavení hodnoty TMEP není platné."));
+        return;
+      }
+      ClockTmepSlotConfig &tmepSlot = config.tmepSlots[index];
+      tmepSlot.enabled = true;
+      clockConfigCopy(tmepSlot.sensorId, sizeof(tmepSlot.sensorId), sensorId);
+      clockConfigCopy(tmepSlot.field, sizeof(tmepSlot.field), field);
+      clockConfigCopy(tmepSlot.unit, sizeof(tmepSlot.unit), unit);
+      tmepSlot.decimals = decimals;
+    } else {
+      if (!validOpenMeteoValue(value)) {
+        sendError(400, F("Nastavení pozice Open-Meteo není platné."));
+        return;
+      }
+      clockConfigCopy(config.openMeteoSlots[index].value,
+                      sizeof(config.openMeteoSlots[index].value), value);
+      config.tmepSlots[index] = ClockTmepSlotConfig{};
+      config.tmepSlots[index].decimals = decimals;
+    }
     clockConfigCopy(config.openMeteoSlots[index].name,
                     sizeof(config.openMeteoSlots[index].name),
-                    server.arg(prefix + F("Name")));
+                    requestArg(prefix + F("Name")));
   }
-  const String webModeValue = server.arg("webMode");
+  const String webModeValue = requestArg("webMode");
   ConfigurationWebMode requestedWebMode = CONFIGURATION_WEB_TIMED;
   if (webModeValue == "always")
     requestedWebMode = CONFIGURATION_WEB_ALWAYS;
@@ -1021,13 +1614,13 @@ void handleSaveConfig() {
     sendError(400, F("Režim webového serveru není platný."));
     return;
   }
-  const String url = normalizedUrl(server.arg("haUrl"));
+  const String url = normalizedUrl(requestArg("haUrl"));
   if (!validHomeAssistantUrl(url)) {
     sendError(400, F("Adresa Home Assistantu musí začínat http:// nebo https://."));
     return;
   }
-  const bool automaticDayNight = server.arg("automaticDayNight") == "1";
-  String sunEntity = server.arg("sunEntity");
+  const bool automaticDayNight = requestArg("automaticDayNight") == "1";
+  String sunEntity = requestArg("sunEntity");
   sunEntity.trim();
   if (config.dataSource == CLOCK_DATA_SOURCE_HOME_ASSISTANT &&
       automaticDayNight && sunEntity.isEmpty()) {
@@ -1036,21 +1629,21 @@ void handleSaveConfig() {
     return;
   }
   clockConfigCopy(config.homeAssistantUrl, sizeof(config.homeAssistantUrl), url);
-  const String submittedToken = server.arg("haToken");
+  const String submittedToken = requestArg("haToken");
   if (!submittedToken.isEmpty()) {
     clockConfigCopy(config.homeAssistantToken,
                     sizeof(config.homeAssistantToken), submittedToken);
   }
   clockConfigCopy(config.weatherEntityId, sizeof(config.weatherEntityId),
-                  server.arg("weatherEntity"));
+                  requestArg("weatherEntity"));
   clockConfigCopy(config.sunEntityId, sizeof(config.sunEntityId),
                   sunEntity);
-  String dayNightLightEntity = server.arg("dayNightLightEntity");
+  String dayNightLightEntity = requestArg("dayNightLightEntity");
   dayNightLightEntity.trim();
   clockConfigCopy(config.dayNightLightEntityId,
                   sizeof(config.dayNightLightEntityId), dayNightLightEntity);
-  const int sunriseOffsetMinutes = server.arg("sunriseOffsetMinutes").toInt();
-  const int sunsetOffsetMinutes = server.arg("sunsetOffsetMinutes").toInt();
+  const int sunriseOffsetMinutes = requestArg("sunriseOffsetMinutes").toInt();
+  const int sunsetOffsetMinutes = requestArg("sunsetOffsetMinutes").toInt();
   if (sunriseOffsetMinutes < -60 || sunriseOffsetMinutes > 60 ||
       sunriseOffsetMinutes % 15 != 0 || sunsetOffsetMinutes < -60 ||
       sunsetOffsetMinutes > 60 || sunsetOffsetMinutes % 15 != 0) {
@@ -1060,8 +1653,8 @@ void handleSaveConfig() {
   }
   config.sunriseOffsetMinutes = static_cast<int8_t>(sunriseOffsetMinutes);
   config.sunsetOffsetMinutes = static_cast<int8_t>(sunsetOffsetMinutes);
-  config.animatedWeatherIcons = server.arg("animatedWeatherIcons") == "1";
-  const String weatherIconStyle = server.arg("weatherIconStyle");
+  config.animatedWeatherIcons = requestArg("animatedWeatherIcons") == "1";
+  const String weatherIconStyle = requestArg("weatherIconStyle");
   if (weatherIconStyle.isEmpty() && !config.animatedWeatherIcons) {
     // Disabled HTML controls are omitted from form submissions. Preserve the
     // stored style so older configuration pages can still disable animations.
@@ -1075,24 +1668,27 @@ void handleSaveConfig() {
     sendError(400, F("Styl animovaných ikon počasí není platný."));
     return;
   }
-  if (!readSideFromForm("left", config.leftSide) ||
-      !readSideFromForm("right", config.rightSide)) {
-    sendError(400, F("Barva místnosti není platná."));
-    return;
-  }
+  readSideFromForm("left", config.leftSide, config.leftValue);
+  readSideFromForm("right", config.rightSide, config.rightValue);
   readMetricFromForm("metricA", config.metricA);
   readMetricFromForm("metricB", config.metricB);
-  if (!readColorScaleFromForm("metricAColor", config.metricAColorScale) ||
+  if (!readColorScaleFromForm("leftValueColor",
+                              config.leftValueColorScale) ||
+      !readColorScaleFromForm("rightValueColor",
+                              config.rightValueColorScale) ||
+      !readColorScaleFromForm("metricAColor", config.metricAColorScale) ||
       !readColorScaleFromForm("metricBColor", config.metricBColorScale)) {
     sendError(400, F("Barevná škála musí obsahovat 1 až 10 platných bodů bez duplicitních hodnot."));
     return;
   }
+  config.leftSide.color = config.leftValueColorScale.points[0].color;
+  config.rightSide.color = config.rightValueColorScale.points[0].color;
   config.dayBrightness =
-      constrain(server.arg("dayBrightness").toInt(), 1, 100);
+      constrain(requestArg("dayBrightness").toInt(), 1, 100);
   config.nightBrightness =
-      constrain(server.arg("nightBrightness").toInt(), 1, 100);
+      constrain(requestArg("nightBrightness").toInt(), 1, 100);
   config.automaticDayNight = automaticDayNight;
-  const String nightVisualMode = server.arg("nightVisualMode");
+  const String nightVisualMode = requestArg("nightVisualMode");
   if (nightVisualMode == "red") {
     config.nightVisualMode = CLOCK_NIGHT_VISUAL_RED;
   } else if (nightVisualMode == "brightness") {
@@ -1102,8 +1698,8 @@ void handleSaveConfig() {
     return;
   }
   config.automaticFirmwareUpdate =
-      firmwareUpdatesEnabled && server.arg("automaticFirmwareUpdate") == "1";
-  const String timeColonEffect = server.arg("timeColonEffect");
+      firmwareUpdatesEnabled && requestArg("automaticFirmwareUpdate") == "1";
+  const String timeColonEffect = requestArg("timeColonEffect");
   if (timeColonEffect == "steady")
     config.timeColonEffect = CLOCK_TIME_COLON_STEADY;
   else if (timeColonEffect == "blink")
@@ -1114,8 +1710,8 @@ void handleSaveConfig() {
     sendError(400, F("Efekt dvojtečky hodin není platný."));
     return;
   }
-  config.showLeadingHourZero = server.arg("showLeadingHourZero") == "1";
-  const String timeFont = server.arg("timeFont");
+  config.showLeadingHourZero = requestArg("showLeadingHourZero") == "1";
+  const String timeFont = requestArg("timeFont");
   if (timeFont == "barlow")
     config.timeFont = CLOCK_TIME_FONT_BARLOW;
   else if (timeFont == "liberation")
@@ -1128,7 +1724,7 @@ void handleSaveConfig() {
     sendError(400, F("Font hodin není platný."));
     return;
   }
-  const String dateFormat = server.arg("dateFormat");
+  const String dateFormat = requestArg("dateFormat");
   if (dateFormat == "weekday-day-month")
     config.dateFormat = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH;
   else if (dateFormat == "numeric")
@@ -1137,31 +1733,33 @@ void handleSaveConfig() {
     config.dateFormat = CLOCK_DATE_FORMAT_DAY_MONTH_YEAR;
   else if (dateFormat == "weekday-day-month-year")
     config.dateFormat = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR;
+  else if (dateFormat == "day-month")
+    config.dateFormat = CLOCK_DATE_FORMAT_DAY_MONTH;
   else if (dateFormat == "hidden")
     config.dateFormat = CLOCK_DATE_FORMAT_HIDDEN;
   else {
     sendError(400, F("Formát data není platný."));
     return;
   }
-  if (!parseHtmlColor(server.arg("timeColor"), config.timeColor) ||
-      !parseHtmlColor(server.arg("dateColor"), config.dateColor) ||
-      !parseHtmlColor(server.arg("leftWeatherIconColor"),
+  if (!parseHtmlColor(requestArg("timeColor"), config.timeColor) ||
+      !parseHtmlColor(requestArg("dateColor"), config.dateColor) ||
+      !parseHtmlColor(requestArg("leftWeatherIconColor"),
                       config.leftWeatherIconColor) ||
-      !parseHtmlColor(server.arg("rightWeatherIconColor"),
+      !parseHtmlColor(requestArg("rightWeatherIconColor"),
                       config.rightWeatherIconColor)) {
     sendError(400, F("Barva hodin, data nebo ikon není platná."));
     return;
   }
-  const String secondEffect = server.arg("secondEffect");
+  const String secondEffect = requestArg("secondEffect");
   if (secondEffect != "off" && secondEffect != "dots" && secondEffect != "line" &&
       secondEffect != "comet") {
     sendError(400, F("Efekt zobrazení vteřin není platný."));
     return;
   }
   config.secondRingEnabled = secondEffect != "off";
-  if (secondEffect != "off" && server.hasArg("secondRingEnabled")) {
+  if (secondEffect != "off" && requestHasArg("secondRingEnabled")) {
     // Kompatibilita se starší webovou stránkou se samostatným přepínačem.
-    config.secondRingEnabled = server.arg("secondRingEnabled") == "1";
+    config.secondRingEnabled = requestArg("secondRingEnabled") == "1";
   }
   if (secondEffect == "comet")
     config.secondEffect = CLOCK_SECOND_EFFECT_COMET;
@@ -1170,27 +1768,33 @@ void handleSaveConfig() {
   else
     config.secondEffect = CLOCK_SECOND_EFFECT_DOTS;
   uint32_t secondRingBackgroundColor;
-  if (!parseHtmlColor(server.arg("secondRingBackgroundColor"),
+  if (!parseHtmlColor(requestArg("secondRingBackgroundColor"),
                       secondRingBackgroundColor)) {
     sendError(400, F("Barva pozadí vteřin není platná."));
     return;
   }
   config.secondRingBackgroundColor = secondRingBackgroundColor;
   config.secondRingBackgroundBrightness = constrain(
-      server.arg("secondRingBackgroundBrightness").toInt(), 0, 255);
+      requestArg("secondRingBackgroundBrightness").toInt(), 0, 255);
   config.secondRingBackgroundDotSize =
-      constrain(server.arg("secondRingBackgroundDotSize").toInt(), 1, 10);
+      constrain(requestArg("secondRingBackgroundDotSize").toInt(), 1, 10);
   config.secondDotSize =
-      constrain(server.arg("secondDotSize").toInt(), 1, 10);
+      constrain(requestArg("secondDotSize").toInt(), 1, 10);
   uint32_t secondDotColor;
-  if (!parseHtmlColor(server.arg("secondDotColor"), secondDotColor)) {
+  if (!parseHtmlColor(requestArg("secondDotColor"), secondDotColor)) {
     sendError(400, F("Barva aktivních vteřin není platná."));
     return;
   }
   config.secondDotColor = secondDotColor;
   config.secondDotBrightness =
-      constrain(server.arg("secondDotBrightness").toInt(), 0, 255);
+      constrain(requestArg("secondDotBrightness").toInt(), 0, 255);
   config.schemaVersion = CLOCK_CONFIG_SCHEMA_VERSION;
+
+  ClockAppearanceConfig appearance;
+  if (!readAppearanceFromRequest(appearance)) {
+    sendError(400, F("Typ nebo tón hodin není platný."));
+    return;
+  }
 
   if (!beginStorageTransaction()) {
     sendError(503, F("Úložiště nastavení nyní není dostupné."));
@@ -1199,9 +1803,13 @@ void handleSaveConfig() {
   const bool configSaved =
       configSaveCallback != nullptr &&
       configSaveCallback(config, !submittedToken.isEmpty());
-  const bool webModeSaved = configSaved && persistWebMode(requestedWebMode);
+  const bool appearanceSaved =
+      configSaved && currentAppearanceSaveCallback != nullptr &&
+      currentAppearanceSaveCallback(appearance);
+  const bool webModeSaved =
+      configSaved && appearanceSaved && persistWebMode(requestedWebMode);
   const bool storageFinished = endStorageTransaction();
-  if (!configSaved || !storageFinished) {
+  if (!configSaved || !appearanceSaved || !storageFinished) {
     sendError(500, F("Nastavení se nepodařilo uložit do paměti."));
     return;
   }
@@ -1209,26 +1817,297 @@ void handleSaveConfig() {
     sendError(500, F("Režim webového serveru se nepodařilo uložit."));
     return;
   }
+  lastSaveConfirmationId = saveConfirmationId;
   extendWebAvailability();
   sendJson(200, F("{\"ok\":true}"));
   applyWebMode(requestedWebMode);
 }
 
+void appendTmepValueJson(String &result, const char *field,
+                         const TmepValue &value, bool &first) {
+  if (!value.available || value.unit[0] == '\0') return;
+  if (!first) result += ',';
+  first = false;
+  result += F("{\"field\":\"");
+  result += field;
+  result += F("\",\"value\":");
+  result += String(value.value, static_cast<unsigned int>(value.decimals));
+  result += F(",\"unit\":\"");
+  result += jsonEscape(value.unit);
+  result += F("\",\"decimals\":");
+  result += value.decimals;
+  result += '}';
+}
+
+void appendTmepCatalogJson(const TmepCatalog &catalog, void *rawResult) {
+  String &result = *static_cast<String *>(rawResult);
+  result.reserve(8192);
+  result = F("{\"ok\":true,\"truncated\":");
+  result += catalog.truncated ? F("true") : F("false");
+  result += F(",\"sensors\":[");
+  for (size_t index = 0; index < catalog.count; ++index) {
+    if (index > 0) result += ',';
+    const TmepSensor &sensor = catalog.sensors[index];
+    result += F("{\"id\":\"");
+    result += jsonEscape(sensor.id);
+    result += F("\",\"title\":\"");
+    result += jsonEscape(sensor.title);
+    result += F("\",\"domain\":\"");
+    result += jsonEscape(sensor.domain);
+    result += F("\",\"location\":\"");
+    result += jsonEscape(sensor.location);
+    result += F("\",\"measuredAt\":\"");
+    result += jsonEscape(sensor.measuredAt);
+    result += F("\",\"values\":[");
+    bool first = true;
+    appendTmepValueJson(result, "teplota", sensor.temperature, first);
+    appendTmepValueJson(result, "vlhkost", sensor.humidity, first);
+    appendTmepValueJson(result, "tlak", sensor.pressure, first);
+    appendTmepValueJson(result, "rssi", sensor.rssi, first);
+    appendTmepValueJson(result, "napeti", sensor.voltage, first);
+    result += F("]}");
+  }
+  result += F("]}");
+}
+
+void handleTmepTest() {
+  const ClockConfig &config = currentConfig();
+  String exportId = config.tmepExportId;
+  String exportKey = config.tmepExportKey;
+  const String submittedTmepUrl = requestArg("tmepExportUrl");
+  if (!submittedTmepUrl.isEmpty() &&
+      !parseTmepExportUrl(submittedTmepUrl, exportId, exportKey)) {
+    sendError(400, F("Exportní URL TMEP není platná."));
+    return;
+  }
+  if (exportId.isEmpty() || exportKey.isEmpty()) {
+    sendError(400, F("Zadej exportní URL TMEP."));
+    return;
+  }
+  int status = HTTPC_ERROR_CONNECTION_REFUSED;
+  String error;
+  String result;
+  const bool useCache = requestArg("cachedOnly") == "1" &&
+                        submittedTmepUrl.isEmpty() &&
+                        tmepVisitCachedCatalog(
+                            exportId.c_str(), exportKey.c_str(),
+                            appendTmepCatalogJson, &result);
+  if (!useCache && requestArg("cachedOnly") == "1") {
+    sendError(409, F("Hodnoty TMEP zatím nejsou načtené."));
+    return;
+  }
+  if (!useCache &&
+      !tmepFetchCatalog(exportId.c_str(), exportKey.c_str(),
+                        appendTmepCatalogJson, &result,
+                        NetworkDiagnosticKind::TmepTest, status, error)) {
+    sendError(status == HTTP_CODE_OK ? 401 : 502, error);
+    return;
+  }
+
+  sendJson(200, result);
+}
+
+void handleTmepRemove() {
+  ClockConfig &config = currentConfig();
+  if (config.tmepExportId[0] == '\0' && config.tmepExportKey[0] == '\0') {
+    sendError(409, F("TMEP.cz už není nastavené."));
+    return;
+  }
+  NetworkOperationGuard networkGuard(8000);
+  if (!networkGuard) {
+    sendError(503, F("Síť je právě vytížená jinou operací."));
+    return;
+  }
+
+  static const char *fallbackValues[] = {
+      "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+      "pressure_msl"};
+  static const char *fallbackNames[] = {"TEPLOTA", "POCITOVÁ", "VLHKOST",
+                                        "TLAK"};
+  config.tmepExportId[0] = '\0';
+  config.tmepExportKey[0] = '\0';
+  for (size_t index = 0; index < 4; ++index) {
+    if (config.tmepSlots[index].enabled) {
+      clockConfigCopy(config.openMeteoSlots[index].value,
+                      sizeof(config.openMeteoSlots[index].value),
+                      fallbackValues[index]);
+      clockConfigCopy(config.openMeteoSlots[index].name,
+                      sizeof(config.openMeteoSlots[index].name),
+                      fallbackNames[index]);
+    }
+    config.tmepSlots[index] = ClockTmepSlotConfig{};
+  }
+  config.schemaVersion = CLOCK_CONFIG_SCHEMA_VERSION;
+  if (!beginStorageTransaction()) {
+    sendError(503, F("Úložiště nastavení nyní není dostupné."));
+    return;
+  }
+  const bool saved = configSaveCallback != nullptr &&
+                     configSaveCallback(config, false);
+  const bool storageFinished = endStorageTransaction();
+  if (!saved || !storageFinished) {
+    sendError(500, F("TMEP.cz se nepodařilo odebrat z paměti."));
+    return;
+  }
+  tmepClearCachedCatalog();
+  networkDiagnosticsReset(NetworkDiagnosticKind::TmepRuntime);
+  networkDiagnosticsReset(NetworkDiagnosticKind::TmepTest);
+  extendWebAvailability();
+  sendJson(200, F("{\"ok\":true}"));
+}
+
+void handleSaveLanguage() {
+  ClockConfig &config = currentConfig();
+  const String language = requestArg("language");
+  if (language == "cs")
+    config.language = CLOCK_LANGUAGE_CZECH;
+  else if (language == "en")
+    config.language = CLOCK_LANGUAGE_ENGLISH;
+  else {
+    sendError(400, F("Jazyk není platný."));
+    return;
+  }
+  config.schemaVersion = CLOCK_CONFIG_SCHEMA_VERSION;
+  if (!beginStorageTransaction()) {
+    sendError(503, F("Úložiště nastavení nyní není dostupné."));
+    return;
+  }
+  const bool saved = configSaveCallback != nullptr &&
+                     configSaveCallback(config, false);
+  const bool storageFinished = endStorageTransaction();
+  if (!saved || !storageFinished) {
+    sendError(500, F("Nastavení se nepodařilo uložit do paměti."));
+    return;
+  }
+  extendWebAvailability();
+  sendJson(200, F("{\"ok\":true}"));
+}
+
+void handleRadarRangeState() {
+  extendWebAvailability();
+  uint16_t savedRadiusKm = 0;
+  uint16_t activeRadiusKm = 0;
+  radarRangeState(savedRadiusKm, activeRadiusKm);
+  String result = F("{\"ok\":true,\"savedRadiusKm\":");
+  result += savedRadiusKm;
+  result += F(",\"activeRadiusKm\":");
+  result += activeRadiusKm;
+  result += F(",\"available\":");
+  result += clockConfigRadarAvailable(currentConfig()) ? F("true")
+                                                        : F("false");
+  result += '}';
+  sendJson(200, result);
+}
+
+void handleRadarRangePreview() {
+  extendWebAvailability();
+  if (!clockConfigRadarAvailable(currentConfig())) {
+    sendError(409, F("Meteoradar ČHMÚ je dostupný pouze pro lokality v České republice."));
+    return;
+  }
+  const int radiusKm = requestArg("radiusKm").toInt();
+  if (!validRadarRadius(radiusKm)) {
+    sendError(400, F("Rozsah meteoradaru není platný."));
+    return;
+  }
+  if (currentRadarRangePreviewCallback == nullptr ||
+      !currentRadarRangePreviewCallback(static_cast<uint16_t>(radiusKm))) {
+    sendError(503, F("Rozsah meteoradaru se nepodařilo změnit."));
+    return;
+  }
+  handleRadarRangeState();
+}
+
+void handleClockAppearancePreview() {
+  extendWebAvailability();
+  ClockAppearanceConfig appearance;
+  if (!readAppearanceFromRequest(appearance)) {
+    sendError(400, F("Typ nebo tón hodin není platný."));
+    return;
+  }
+  if (currentAppearancePreviewCallback == nullptr ||
+      !currentAppearancePreviewCallback(appearance)) {
+    sendError(503, F("Náhled vzhledu hodin se nepodařilo změnit."));
+    return;
+  }
+  ClockAppearanceConfig saved;
+  ClockAppearanceConfig active;
+  appearanceState(saved, active);
+  String result = F("{\"ok\":true,\"clockStyle\":\"");
+  result += saved.style == CLOCK_STYLE_ANALOG ? F("analog") : F("digital");
+  result += F("\",\"activeClockStyle\":\"");
+  result += active.style == CLOCK_STYLE_ANALOG ? F("analog") : F("digital");
+  result += F("\",\"analogToneColor\":\"");
+  result += htmlColor(saved.analogToneColor);
+  result += F("\",\"activeAnalogToneColor\":\"");
+  result += htmlColor(active.analogToneColor);
+  result += F("\",\"analogHandToneColor\":\"");
+  result += htmlColor(saved.analogHandToneColor);
+  result += F("\",\"activeAnalogHandToneColor\":\"");
+  result += htmlColor(active.analogHandToneColor);
+  result += F("\",\"analogCardinalAccentColor\":\"");
+  result += htmlColor(saved.analogCardinalAccentColor);
+  result += F("\",\"activeAnalogCardinalAccentColor\":\"");
+  result += htmlColor(active.analogCardinalAccentColor);
+  result += F("\",\"analogDateFormat\":\"");
+  result += dateFormatName(saved.analogDateFormat);
+  result += F("\",\"activeAnalogDateFormat\":\"");
+  result += dateFormatName(active.analogDateFormat);
+  result += F("\",\"analogDateColor\":\"");
+  result += htmlColor(saved.analogDateColor);
+  result += F("\",\"activeAnalogDateColor\":\"");
+  result += htmlColor(active.analogDateColor);
+  result += F("\",\"analogCardinalAccentsEnabled\":");
+  result += saved.analogCardinalAccentsEnabled ? F("true") : F("false");
+  result += F(",\"activeAnalogCardinalAccentsEnabled\":");
+  result += active.analogCardinalAccentsEnabled ? F("true") : F("false");
+  result += F(",\"analogOutlineHandsEnabled\":");
+  result += saved.analogOutlineHandsEnabled ? F("true") : F("false");
+  result += F(",\"activeAnalogOutlineHandsEnabled\":");
+  result += active.analogOutlineHandsEnabled ? F("true") : F("false");
+  result += F(",\"analogMonochromeValuesEnabled\":");
+  result += saved.analogMonochromeValuesEnabled ? F("true") : F("false");
+  result += F(",\"activeAnalogMonochromeValuesEnabled\":");
+  result += active.analogMonochromeValuesEnabled ? F("true") : F("false");
+  result += F(",\"analogValuesAboveHandsEnabled\":");
+  result += saved.analogValuesAboveHandsEnabled ? F("true") : F("false");
+  result += F(",\"activeAnalogValuesAboveHandsEnabled\":");
+  result += active.analogValuesAboveHandsEnabled ? F("true") : F("false");
+  result += F(",\"monochromeWeatherIconColor\":\"");
+  result += htmlColor(saved.monochromeWeatherIconColor);
+  result += F("\",\"activeMonochromeWeatherIconColor\":\"");
+  result += htmlColor(active.monochromeWeatherIconColor);
+  result += '"';
+  result += F("}");
+  sendJson(200, result);
+}
+
 void handleOpenMeteoLocation() {
-  String city = server.arg("city");
+  String city = requestArg("city");
   city.trim();
   if (city.length() < 2) {
     sendError(400, F("Zadej název města."));
     return;
   }
   networkDiagnosticsBegin(NetworkDiagnosticKind::OpenMeteoTest);
+  NetworkOperationGuard networkGuard(8000);
+  if (!networkGuard) {
+    networkDiagnosticsEnd(NetworkDiagnosticKind::OpenMeteoTest, false,
+                          HTTPC_ERROR_CONNECTION_REFUSED);
+    sendError(503, F("Síť je právě vytížená jinou operací."));
+    return;
+  }
   WiFiClientSecure client;
   client.setCACert(FIRMWARE_RELEASE_ROOT_CA);
   HTTPClient http;
   http.setConnectTimeout(5000);
   http.setTimeout(8000);
-  const String url = String(F("https://geocoding-api.open-meteo.com/v1/search?count=10&language=cs&format=json&name=")) +
-                     urlEncode(city);
+  const bool englishLanguage =
+      currentConfig().language == CLOCK_LANGUAGE_ENGLISH;
+  const String url =
+      String(F("https://geocoding-api.open-meteo.com/v1/search?count=10&language=")) +
+      (englishLanguage ? F("en") : F("cs")) + F("&format=json&name=") +
+      urlEncode(city);
   int status = HTTPC_ERROR_CONNECTION_REFUSED;
   String payload;
   if (http.begin(client, url)) {
@@ -1241,7 +2120,7 @@ void handleOpenMeteoLocation() {
   if (!ok) {
     sendError(502, status == HTTP_CODE_OK
                        ? F("Město nebylo nalezeno.")
-                       : F("Open-Meteo nyní není dostupné."));
+                       : F("Geokódovací služba nyní není dostupná."));
     return;
   }
   sendJson(200, payload);
@@ -1256,10 +2135,17 @@ void handleTestConnection() {
     return;
   }
   int status;
-  String entityId = server.arg("haEntity");
+  String entityId = requestArg("haEntity");
   entityId.trim();
   if (entityId.isEmpty()) entityId = currentConfig().weatherEntityId;
   networkDiagnosticsBegin(NetworkDiagnosticKind::HomeAssistantTest);
+  NetworkOperationGuard networkGuard(8000);
+  if (!networkGuard) {
+    networkDiagnosticsEnd(NetworkDiagnosticKind::HomeAssistantTest, false,
+                          HTTPC_ERROR_CONNECTION_REFUSED);
+    sendError(503, F("Síť je právě vytížená jinou operací."));
+    return;
+  }
   if (url.startsWith("https://")) {
     WiFiClientSecure client;
     client.setInsecure();
@@ -1301,6 +2187,8 @@ void appendDiagnosticJson(String &result,
   result += snapshot.failures;
   result += F(",\"lastResult\":");
   result += snapshot.lastResult;
+  result += F(",\"lastSuccess\":");
+  result += snapshot.lastSuccess ? F("true") : F("false");
   result += F(",\"lastStartedAt\":");
   result += snapshot.lastStartedAt;
   result += F(",\"lastFinishedAt\":");
@@ -1317,6 +2205,10 @@ void appendDiagnosticJson(String &result,
 
 void handleDiagnostics() {
   const FirmwareUpdateSnapshot firmware = firmwareUpdateServiceSnapshot();
+  ChmiRadarDiagnostics radar;
+  if (radarEnabled && chmiRadarServiceDiagnostics != nullptr)
+    chmiRadarServiceDiagnostics(radar);
+  const ClockConfig &config = currentConfig();
   bool sunAvailable = false;
   bool sunIsDay = true;
   bool lightAvailable = false;
@@ -1327,7 +2219,7 @@ void handleDiagnostics() {
                                   lightOn, nightMode);
   }
   String result;
-  result.reserve(1800);
+  result.reserve(2400);
   result = F("{\"ok\":true,\"configurationAvailable\":");
   result += webActive ? F("true") : F("false");
   result += F(",\"webMode\":\"");
@@ -1337,6 +2229,8 @@ void handleDiagnostics() {
     result += F("disabled");
   else
     result += F("timed");
+  result += F("\",\"language\":\"");
+  result += config.language == CLOCK_LANGUAGE_ENGLISH ? F("en") : F("cs");
   result += F("\",\"firmwareVersion\":\"");
   result += jsonEscape(FIRMWARE_VERSION);
   result += F("\",\"chipModel\":\"");
@@ -1345,6 +2239,10 @@ void handleDiagnostics() {
   result += ESP.getChipRevision();
   result += F(",\"cpuFrequencyMHz\":");
   result += ESP.getCpuFreqMHz();
+  result += F(",\"displayPixelClockHz\":");
+  result += LCD_GetPixelClock != nullptr ? LCD_GetPixelClock() : 0;
+  result += F(",\"resetReason\":");
+  result += static_cast<int>(esp_reset_reason());
   result += F(",\"flashSize\":");
   result += ESP.getFlashChipSize();
   result += F(",\"psramSize\":");
@@ -1378,6 +2276,70 @@ void handleDiagnostics() {
   result += millis();
   result += F(",\"currentMemory\":");
   appendMemoryJson(result, networkDiagnosticsCurrentMemory());
+  result += F(",\"minimumMemory\":{\"internalFree\":");
+  result += static_cast<unsigned long>(heap_caps_get_minimum_free_size(
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  result += F(",\"psramFree\":");
+  result += static_cast<unsigned long>(
+      heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  result += '}';
+  if (!radarEnabled) {
+    result += F(",\"chmiRadar\":null");
+  } else {
+  result += F(",\"chmiRadar\":{\"active\":");
+  result += radar.active ? F("true") : F("false");
+  result += F(",\"loading\":");
+  result += radar.loading ? F("true") : F("false");
+  result += F(",\"ready\":");
+  result += radar.ready ? F("true") : F("false");
+  result += F(",\"preparationInProgress\":");
+  result += radar.preparationInProgress ? F("true") : F("false");
+  result += F(",\"available\":");
+  result += clockConfigRadarAvailable(config) ? F("true") : F("false");
+  result += F(",\"location\":\"");
+  result += jsonEscape(config.openMeteoCity);
+  result += F("\",\"latitude\":");
+  result += String(config.openMeteoLatitude, 5);
+  result += F(",\"longitude\":");
+  result += String(config.openMeteoLongitude, 5);
+  result += F(",\"radiusKm\":");
+  result += radar.radiusKm;
+  result += F(",\"requestedFrameCount\":");
+  result += radar.requestedFrameCount;
+  result += F(",\"preparedFrameCount\":");
+  result += radar.preparedFrameCount;
+  result += F(",\"animationFrameCount\":");
+  result += radar.animationFrameCount;
+  result += F(",\"pendingRefreshCount\":");
+  result += radar.pendingRefreshCount;
+  result += F(",\"lastSuccessfulRefreshAvailable\":");
+  result += radar.lastSuccessfulRefreshAvailable ? F("true") : F("false");
+  result += F(",\"lastSuccessfulRefreshAgeMs\":");
+  result += radar.lastSuccessfulRefreshAgeMs;
+  result += F(",\"nextRefreshInMs\":");
+  result += radar.nextRefreshInMs;
+  result += F(",\"lastHttpStatus\":");
+  result += radar.lastHttpStatus;
+  result += F(",\"lastDownloadedBytes\":");
+  result += static_cast<unsigned long>(radar.lastDownloadedBytes);
+  result += F(",\"lastDecodeResult\":");
+  result += radar.lastDecodeResult;
+  result += F(",\"lastDecodedLineCount\":");
+  result += radar.lastDecodedLineCount;
+  result += F(",\"acceptedCompleteDecodeError\":");
+  result += radar.acceptedCompleteDecodeError ? F("true") : F("false");
+  result += F(",\"latestIndexFile\":\"");
+  result += jsonEscape(radar.latestIndexFile);
+  result += F("\",\"currentFile\":\"");
+  result += jsonEscape(radar.currentFile);
+  result += F("\",\"oldestFrameTime\":\"");
+  result += jsonEscape(radar.oldestFrameTime);
+  result += F("\",\"newestFrameTime\":\"");
+  result += jsonEscape(radar.newestFrameTime);
+  result += F("\",\"message\":\"");
+  result += jsonEscape(radar.message);
+  result += F("\"}");
+  }
   result += F(",\"homeAssistantRuntime\":");
   appendDiagnosticJson(
       result, networkDiagnosticsSnapshot(
@@ -1397,6 +2359,12 @@ void handleDiagnostics() {
   result += F(",\"openMeteoTest\":");
   appendDiagnosticJson(
       result, networkDiagnosticsSnapshot(NetworkDiagnosticKind::OpenMeteoTest));
+  result += F(",\"tmepRuntime\":");
+  appendDiagnosticJson(
+      result, networkDiagnosticsSnapshot(NetworkDiagnosticKind::TmepRuntime));
+  result += F(",\"tmepTest\":");
+  appendDiagnosticJson(
+      result, networkDiagnosticsSnapshot(NetworkDiagnosticKind::TmepTest));
   result += '}';
   sendJson(200, result);
 }
@@ -1508,44 +2476,116 @@ void handleFirmwareInstall() {
   sendJson(202,
            F("{\"ok\":true,\"message\":\"Kontrola a aktualizace byly spuštěny.\"}"));
 }
+bool requireAcceptedPostBody() {
+  if (boundedServerInstance == nullptr) return true;
+  if (server.header("Content-Type").startsWith("multipart/")) {
+    sendError(415, F("Formát multipart není podporovaný."));
+    return false;
+  }
+  if (boundedServerInstance->postBodyAccepted()) return true;
+  if (boundedServerInstance->postBodyTooLarge()) {
+    sendError(413, F("Požadavek je příliš velký."));
+  } else if (boundedServerInstance->postBodyMalformed()) {
+    sendError(400, F("Formulář obsahuje příliš dlouhé nebo neplatné pole."));
+  } else {
+    sendError(503, F("Pro zpracování požadavku není dost paměti."));
+  }
+  return false;
+}
+
+void registerBoundedPost(const String &uri,
+                         WebServer::THandlerFunction handler) {
+  ::registerBoundedPost(
+      server, boundedServerInstance, uri,
+      [handler]() {
+        if (requireAcceptedPostBody()) handler();
+      }, []() { requireAcceptedPostBody(); });
+}
+
+class ControlRequestHandler final : public RequestHandler {
+ public:
+  bool canHandle(WebServer &, HTTPMethod method, const String &uri) override {
+    return method == HTTP_POST &&
+           (uri.startsWith(apiPath("/control/")) ||
+            (legacyAliasesEnabled && uri.startsWith("/api/control/")));
+  }
+
+  bool canRaw(WebServer &, const String &uri) override {
+    return uri.startsWith(apiPath("/control/")) ||
+           (legacyAliasesEnabled && uri.startsWith("/api/control/"));
+  }
+
+  bool handle(WebServer &, HTTPMethod, const String &) override {
+    if (requireAcceptedPostBody()) handleControlRequest();
+    if (boundedServerInstance != nullptr)
+      boundedServerInstance->endBoundedPostRequest();
+    return true;
+  }
+
+  void raw(WebServer &, const String &, HTTPRaw &raw) override {
+    if (boundedServerInstance != nullptr)
+      boundedServerInstance->captureRawPost(raw);
+  }
+};
+}  // namespace
 
 void registerApiRoutes(const String &prefix) {
-  server.on(prefix + F("/auth/login"), HTTP_POST, handleWebLogin);
-  server.on(prefix + F("/web-password"), HTTP_POST, []() {
+  registerBoundedPost(prefix + F("/auth/login"), handleWebLogin);
+  registerBoundedPost(prefix + F("/web-password"), []() {
     if (requireConfigurationAccess()) handleWebPassword();
   });
   server.on(prefix + F("/config"), HTTP_GET, []() {
     if (requireConfigurationAccess()) handleGetConfig();
   });
-  server.on(prefix + F("/config"), HTTP_POST, []() {
+  registerBoundedPost(prefix + F("/config"), []() {
     if (requireConfigurationAccess()) handleSaveConfig();
   });
-  server.on(prefix + F("/ha/test"), HTTP_POST, []() {
+  registerBoundedPost(prefix + F("/language"), []() {
+    if (requireConfigurationAccess()) handleSaveLanguage();
+  });
+  registerBoundedPost(prefix + F("/ha/test"), []() {
     if (requireConfigurationAccess()) handleTestConnection();
   });
-  server.on(prefix + F("/open-meteo/location"), HTTP_POST, []() {
+  registerBoundedPost(prefix + F("/open-meteo/location"), []() {
     if (requireConfigurationAccess()) handleOpenMeteoLocation();
   });
-  server.on(prefix + F("/restart"), HTTP_POST, []() {
+  registerBoundedPost(prefix + F("/tmep/test"), []() {
+    if (requireConfigurationAccess()) handleTmepTest();
+  });
+  registerBoundedPost(prefix + F("/tmep/remove"), []() {
+    if (requireConfigurationAccess()) handleTmepRemove();
+  });
+  if (radarEnabled) {
+    server.on(prefix + F("/radar/state"), HTTP_GET, []() {
+      if (requireConfigurationAccess()) handleRadarRangeState();
+    });
+    registerBoundedPost(prefix + F("/radar/preview"), []() {
+      if (requireConfigurationAccess()) handleRadarRangePreview();
+    });
+  }
+  registerBoundedPost(prefix + F("/clock-appearance/preview"), []() {
+    if (requireConfigurationAccess()) handleClockAppearancePreview();
+  });
+  registerBoundedPost(prefix + F("/restart"), []() {
     if (requireConfigurationAccess()) handleRestart();
   });
   if (firmwareUpdatesEnabled) {
     server.on(prefix + F("/firmware"), HTTP_GET, []() {
       if (requireConfigurationAccess()) handleFirmwareStatus();
     });
-    server.on(prefix + F("/firmware/check"), HTTP_POST, []() {
+    registerBoundedPost(prefix + F("/firmware/check"), []() {
       if (requireConfigurationAccess()) handleFirmwareCheck();
     });
-    server.on(prefix + F("/firmware/install"), HTTP_POST, []() {
+    registerBoundedPost(prefix + F("/firmware/install"), []() {
       if (requireConfigurationAccess()) handleFirmwareInstall();
     });
     server.on(prefix + F("/update-status"), HTTP_GET, []() {
       if (requireConfigurationAccess()) handleFirmwareStatus();
     });
-    server.on(prefix + F("/check-update"), HTTP_POST, []() {
+    registerBoundedPost(prefix + F("/check-update"), []() {
       if (requireConfigurationAccess()) handleFirmwareCheck();
     });
-    server.on(prefix + F("/install-update"), HTTP_POST, []() {
+    registerBoundedPost(prefix + F("/install-update"), []() {
       if (requireConfigurationAccess()) handleFirmwareInstall();
     });
   }
@@ -1553,15 +2593,7 @@ void registerApiRoutes(const String &prefix) {
   server.on(prefix + F("/status"), HTTP_GET, handleDiagnostics);
   server.on(prefix + F("/runtime"), HTTP_GET, handleDiagnostics);
 
-  if (!controlSecret.isEmpty()) {
-    const String controlBase = prefix + F("/control/") + controlSecret;
-    server.on(controlBase + F("/display/off"), HTTP_POST,
-              handleControlRequest);
-    server.on(controlBase + F("/display/on"), HTTP_POST,
-              handleControlRequest);
-    server.on(controlBase + F("/day-night/refresh"), HTTP_POST,
-              handleControlRequest);
-  }
+  if (!controlSecret.isEmpty()) server.addHandler(new ControlRequestHandler());
 }
 
 void initializeConfigurationWeb(
@@ -1572,7 +2604,12 @@ void initializeConfigurationWeb(
     HomeAssistantRefreshCallback refreshCallback,
     DayNightStatusCallback dayNightStatusCallback,
     DisplayPowerCallback displayPowerCallback,
-    DisplayPowerStatusCallback displayPowerStatusCallback) {
+    DisplayPowerStatusCallback displayPowerStatusCallback,
+    RadarRangeStateCallback radarRangeStateCallback,
+    RadarRangePreviewCallback radarRangePreviewCallback,
+    ClockAppearanceStateCallback appearanceStateCallback,
+    ClockAppearanceChangeCallback appearancePreviewCallback,
+    ClockAppearanceChangeCallback appearanceSaveCallback) {
   configLoadCallback = loadCallback;
   configSaveCallback = saveCallback;
   webStatusCallback = statusCallback;
@@ -1581,19 +2618,26 @@ void initializeConfigurationWeb(
   currentDayNightStatusCallback = dayNightStatusCallback;
   currentDisplayPowerCallback = displayPowerCallback;
   currentDisplayPowerStatusCallback = displayPowerStatusCallback;
+  currentRadarRangeStateCallback = radarRangeStateCallback;
+  currentRadarRangePreviewCallback = radarRangePreviewCallback;
+  currentAppearanceStateCallback = appearanceStateCallback;
+  currentAppearancePreviewCallback = appearancePreviewCallback;
+  currentAppearanceSaveCallback = appearanceSaveCallback;
   initializeControlSecret();
   initializeWebPassword();
+  if (boundedServerInstance != nullptr)
+    boundedServerInstance->beginBoundedPostSupport();
   Preferences preferences;
   if (preferences.begin(WEB_PREFS_NAMESPACE, true, "clockcfg")) {
     selectedWebMode = static_cast<ConfigurationWebMode>(constrain(
-        preferences.getUChar(WEB_PREFS_KEY, CONFIGURATION_WEB_TIMED),
+        preferences.getUChar(WEB_PREFS_KEY, CONFIGURATION_WEB_ALWAYS),
         static_cast<uint8_t>(CONFIGURATION_WEB_TIMED),
         static_cast<uint8_t>(CONFIGURATION_WEB_DISABLED)));
     preferences.end();
   }
-
-  const char *collectedHeaders[] = {"Cookie", "Origin"};
-  server.collectHeaders(collectedHeaders, 2);
+  const char *collectedHeaders[] = {"Cookie", "Origin", "Content-Type",
+                                    "Accept-Language"};
+  server.collectHeaders(collectedHeaders, 4);
   server.on(configurationPagePath, HTTP_GET, handleRoot);
   String pageWithoutSlash = configurationPagePath;
   if (pageWithoutSlash.length() > 1 && pageWithoutSlash.endsWith("/")) {
@@ -1603,6 +2647,13 @@ void initializeConfigurationWeb(
       server.send(302, F("text/plain; charset=utf-8"), String());
     });
   }
+  server.on("/ui-language.js", HTTP_GET, []() {
+    addSecurityHeaders();
+    server.send_P(200, PSTR("text/javascript; charset=utf-8"),
+                  CONFIGURATION_LOCALIZATION_JS);
+  });
+  server.on(configurationPagePath + F("diagnostics"), HTTP_GET,
+            handleDiagnosticPage);
   registerApiRoutes(configurationApiPrefix);
 
   if (legacyAliasesEnabled) {
@@ -1615,15 +2666,12 @@ void initializeConfigurationWeb(
     });
     server.begin();
   }
-
   if (selectedWebMode != CONFIGURATION_WEB_DISABLED) {
     unlockConfiguration(true);
   } else {
     notifyWebStatus();
   }
 }
-}  // namespace
-
 void configurationWebBegin(ClockConfigLoadCallback loadCallback,
                            ClockConfigSaveCallback saveCallback,
                            ConfigurationWebStatusCallback statusCallback,
@@ -1631,12 +2679,19 @@ void configurationWebBegin(ClockConfigLoadCallback loadCallback,
                            HomeAssistantRefreshCallback refreshCallback,
                            DayNightStatusCallback dayNightStatusCallback,
                            DisplayPowerCallback displayPowerCallback,
-                           DisplayPowerStatusCallback displayPowerStatusCallback) {
+                           DisplayPowerStatusCallback displayPowerStatusCallback,
+                           RadarRangeStateCallback radarRangeStateCallback,
+                           RadarRangePreviewCallback radarRangePreviewCallback,
+                           ClockAppearanceStateCallback appearanceStateCallback,
+                           ClockAppearanceChangeCallback appearancePreviewCallback,
+                           ClockAppearanceChangeCallback appearanceSaveCallback) {
   ConfigurationWebRoutes options;
   configurationWebBeginWithOptions(
       options, loadCallback, saveCallback, statusCallback, sunTimesCallback,
       refreshCallback, dayNightStatusCallback, displayPowerCallback,
-      displayPowerStatusCallback);
+      displayPowerStatusCallback, radarRangeStateCallback,
+      radarRangePreviewCallback, appearanceStateCallback,
+      appearancePreviewCallback, appearanceSaveCallback);
 }
 
 bool configurationWebBeginWithOptions(
@@ -1647,24 +2702,36 @@ bool configurationWebBeginWithOptions(
     HomeAssistantRefreshCallback refreshCallback,
     DayNightStatusCallback dayNightStatusCallback,
     DisplayPowerCallback displayPowerCallback,
-    DisplayPowerStatusCallback displayPowerStatusCallback) {
+    DisplayPowerStatusCallback displayPowerStatusCallback,
+    RadarRangeStateCallback radarRangeStateCallback,
+    RadarRangePreviewCallback radarRangePreviewCallback,
+    ClockAppearanceStateCallback appearanceStateCallback,
+    ClockAppearanceChangeCallback appearancePreviewCallback,
+    ClockAppearanceChangeCallback appearanceSaveCallback) {
   if (!options.manageServerLifecycle && options.webServer == nullptr)
     return false;
   if ((options.storageBegin == nullptr) != (options.storageEnd == nullptr))
     return false;
   serverInstance =
       options.webServer == nullptr ? &ownedServer() : options.webServer;
+  boundedServerInstance =
+      options.webServer == nullptr || options.boundedPostSupport
+          ? static_cast<BoundedWebServer *>(serverInstance)
+          : nullptr;
   configurationPagePath = normalizedPagePath(options.pagePath);
   configurationApiPrefix = normalizedApiPrefix(options.apiPrefix);
   legacyAliasesEnabled = options.registerLegacyAliases;
   serverLifecycleManaged = options.manageServerLifecycle;
   firmwareUpdatesEnabled = options.firmwareUpdatesEnabled;
+  radarEnabled = options.radarEnabled;
   storageBeginCallback = options.storageBegin;
   storageEndCallback = options.storageEnd;
   initializeConfigurationWeb(
       loadCallback, saveCallback, statusCallback, sunTimesCallback,
       refreshCallback, dayNightStatusCallback, displayPowerCallback,
-      displayPowerStatusCallback);
+      displayPowerStatusCallback, radarRangeStateCallback,
+      radarRangePreviewCallback, appearanceStateCallback,
+      appearancePreviewCallback, appearanceSaveCallback);
   return true;
 }
 

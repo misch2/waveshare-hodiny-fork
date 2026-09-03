@@ -12,6 +12,14 @@ using SunTransitionTimesCallback = void (*)(uint64_t &nextSunriseTimestamp,
 using HomeAssistantRefreshCallback = bool (*)();
 using DisplayPowerCallback = void (*)(bool forcedOff);
 using DisplayPowerStatusCallback = bool (*)();
+using RadarRangeStateCallback = void (*)(uint16_t &savedRadiusKm,
+                                         uint16_t &activeRadiusKm);
+using RadarRangePreviewCallback = bool (*)(uint16_t radiusKm);
+using ClockAppearanceStateCallback = void (*)(
+    ClockAppearanceConfig &savedAppearance,
+    ClockAppearanceConfig &activeAppearance);
+using ClockAppearanceChangeCallback = bool (*)(
+    const ClockAppearanceConfig &appearance);
 using DayNightStatusCallback = void (*)(bool &sunAvailable, bool &sunIsDay,
                                         bool &lightAvailable, bool &lightOn,
                                         bool &nightMode);
@@ -29,7 +37,12 @@ void configurationWebBegin(ClockConfigLoadCallback loadCallback,
                            HomeAssistantRefreshCallback refreshCallback,
                            DayNightStatusCallback dayNightStatusCallback,
                            DisplayPowerCallback displayPowerCallback,
-                           DisplayPowerStatusCallback displayPowerStatusCallback);
+                           DisplayPowerStatusCallback displayPowerStatusCallback,
+                           RadarRangeStateCallback radarRangeStateCallback = nullptr,
+                           RadarRangePreviewCallback radarRangePreviewCallback = nullptr,
+                           ClockAppearanceStateCallback appearanceStateCallback = nullptr,
+                           ClockAppearanceChangeCallback appearancePreviewCallback = nullptr,
+                           ClockAppearanceChangeCallback appearanceSaveCallback = nullptr);
 bool configurationWebBeginWithOptions(
     const ConfigurationWebRoutes& options,
     ClockConfigLoadCallback loadCallback, ClockConfigSaveCallback saveCallback,
@@ -38,7 +51,12 @@ bool configurationWebBeginWithOptions(
     HomeAssistantRefreshCallback refreshCallback,
     DayNightStatusCallback dayNightStatusCallback,
     DisplayPowerCallback displayPowerCallback,
-    DisplayPowerStatusCallback displayPowerStatusCallback);
+    DisplayPowerStatusCallback displayPowerStatusCallback,
+    RadarRangeStateCallback radarRangeStateCallback = nullptr,
+    RadarRangePreviewCallback radarRangePreviewCallback = nullptr,
+    ClockAppearanceStateCallback appearanceStateCallback = nullptr,
+    ClockAppearanceChangeCallback appearancePreviewCallback = nullptr,
+    ClockAppearanceChangeCallback appearanceSaveCallback = nullptr);
 void configurationWebLoop();
 void configurationWebEnsureActive();
 void configurationWebExtendAvailability();

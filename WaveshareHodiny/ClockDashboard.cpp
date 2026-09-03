@@ -6,8 +6,10 @@
 
 #include <cmath>
 #include <cstring>
+#include <esp_heap_caps.h>
 
 #include "ClockFonts.h"
+#include "DisplayDriver.h"
 #include "FirmwareUpdateService.h"
 
 namespace {
@@ -28,11 +30,33 @@ constexpr unsigned long SECOND_LINE_FADE_TOTAL_MS = 4000;
 constexpr unsigned long SECOND_FADE_DOT_MS = 200;
 constexpr unsigned long SECOND_FADE_START_SPAN_MS =
     SECOND_DOT_FADE_TOTAL_MS - SECOND_FADE_DOT_MS;
-constexpr unsigned long SECOND_FADE_FRAME_MS = 25;
-constexpr unsigned long TIME_COLON_FADE_FRAME_MS = 25;
-constexpr unsigned long SECOND_COMET_FRAME_MS = 16;
+// Plynulé efekty držíme pod fyzickou obnovovací frekvencí panelu, aby se do
+// jednoho snímku zbytečně neposílalo více různých stavů.
+constexpr unsigned long SMOOTH_EFFECT_FRAME_MS = 40;
 constexpr float SECOND_COMET_TRAIL_SECONDS = 12.0f;
 constexpr unsigned long WEATHER_ANIMATION_REVEAL_DELAY_MS = 100;
+constexpr float ANALOG_PI = 3.14159265358979323846f;
+constexpr int ANALOG_CENTER_X = 240;
+constexpr int ANALOG_CENTER_Y = 240;
+constexpr int ANALOG_RING_RADIUS = 239;
+// Jediný osový obdélník kolem šikmé ručičky může pokrýt desítky tisíc
+// pixelů. Pevné pásy omezí překreslení na okolí skutečného tahu a současně
+// udrží i starou a novou polohu všech ručiček pod 32 dirty oblastmi LVGL.
+constexpr lv_coord_t ANALOG_HAND_INVALIDATION_STRIP = 96;
+uint8_t activeClockStyle = CLOCK_STYLE_DIGITAL;
+uint32_t analogToneColor = 0x00D6FF;
+uint32_t analogHandToneColor = 0x00D6FF;
+uint32_t analogCardinalAccentColor = 0xFFAB00;
+bool analogCardinalAccentsEnabled = true;
+bool analogOutlineHandsEnabled = false;
+bool analogMonochromeValuesEnabled = false;
+bool analogValuesAboveHandsEnabled = false;
+uint32_t analogDateColor = 0xB5B5B5;
+uint32_t monochromeWeatherIconColor = 0xFFFFFF;
+ClockConfig dashboardRuntimeConfig;
+bool dashboardRuntimeConfigAvailable = false;
+
+bool analogLayoutEnabled() { return activeClockStyle == CLOCK_STYLE_ANALOG; }
 
 lv_obj_t *timeLabel = nullptr;
 lv_obj_t *dateLabel = nullptr;
@@ -60,6 +84,12 @@ lv_obj_t *wifiStatusLabel = nullptr;
 lv_obj_t *statusLabel = nullptr;
 lv_obj_t *webStatusLabel = nullptr;
 lv_obj_t *dashboardContent = nullptr;
+lv_obj_t *radarPage = nullptr;
+lv_obj_t *radarCanvas = nullptr;
+lv_obj_t *radarTitleLabel = nullptr;
+lv_obj_t *radarProgressBar = nullptr;
+bool radarFullPreparationInProgress = false;
+lv_obj_t *radarStatusLabel = nullptr;
 lv_obj_t *settingsPage = nullptr;
 lv_obj_t *dayBrightnessSlider = nullptr;
 lv_obj_t *nightBrightnessSlider = nullptr;
@@ -70,19 +100,70 @@ lv_obj_t *secondModeDropdown = nullptr;
 lv_obj_t *weatherIconModeDropdown = nullptr;
 lv_obj_t *automaticUpdateSwitch = nullptr;
 lv_obj_t *webModeDropdown = nullptr;
-lv_obj_t *settingsContent[3] = {};
+constexpr uint8_t SETTINGS_PAGE_COUNT = 4;
+lv_obj_t *settingsContent[SETTINGS_PAGE_COUNT] = {};
 lv_obj_t *settingsPreviousButton = nullptr;
 lv_obj_t *settingsNextButton = nullptr;
 lv_obj_t *settingsPageNumberLabel = nullptr;
+lv_obj_t *clockStyleTitleLabel = nullptr;
+lv_obj_t *digitalClockStyleCard = nullptr;
+lv_obj_t *analogClockStyleCard = nullptr;
+lv_obj_t *digitalClockStyleLabel = nullptr;
+lv_obj_t *analogClockStyleLabel = nullptr;
 lv_obj_t *deviceInfoLabel = nullptr;
 lv_obj_t *firmwareStatusLabel = nullptr;
 lv_obj_t *firmwareCheckButton = nullptr;
 lv_obj_t *firmwareInstallButton = nullptr;
+lv_obj_t *dayBrightnessTitleLabel = nullptr;
+lv_obj_t *nightBrightnessTitleLabel = nullptr;
+lv_obj_t *automaticDayNightTitleLabel = nullptr;
+lv_obj_t *weatherIconModeTitleLabel = nullptr;
+lv_obj_t *secondModeTitleLabel = nullptr;
+lv_obj_t *webModeTitleLabel = nullptr;
+lv_obj_t *automaticUpdateTitleLabel = nullptr;
+lv_obj_t *firmwareCheckLabel = nullptr;
+lv_obj_t *firmwareInstallLabel = nullptr;
 lv_obj_t *wifiAddressLabel = nullptr;
 lv_obj_t *firmwareVersionLabel = nullptr;
 lv_obj_t *firmwareUpdateOverlay = nullptr;
 lv_obj_t *firmwareUpdateTitleLabel = nullptr;
 lv_obj_t *firmwareUpdateCountdownLabel = nullptr;
+lv_obj_t *analogDialLayer = nullptr;
+lv_obj_t *analogHandsLayer = nullptr;
+lv_obj_t *analogOutsideTitleLabel = nullptr;
+lv_obj_t *analogOutsideValueLabel = nullptr;
+lv_obj_t *analogOutsideDecimalLabel = nullptr;
+lv_obj_t *analogOutsideUnitLabel = nullptr;
+lv_obj_t *analogRoomTitleLabel = nullptr;
+lv_obj_t *analogRoomValueLabel = nullptr;
+lv_obj_t *analogRoomDecimalLabel = nullptr;
+lv_obj_t *analogRoomUnitLabel = nullptr;
+lv_obj_t *analogMetricATitleLabel = nullptr;
+lv_obj_t *analogMetricAValueLabel = nullptr;
+lv_obj_t *analogMetricAUnitLabel = nullptr;
+lv_obj_t *analogMetricBTitleLabel = nullptr;
+lv_obj_t *analogMetricBValueLabel = nullptr;
+lv_obj_t *analogMetricBUnitLabel = nullptr;
+lv_obj_t *analogMetricDivider = nullptr;
+
+struct AnalogDialRun {
+  uint16_t length;
+  lv_color_t color;
+};
+
+struct AnalogDialCache {
+  uint32_t *rowOffsets = nullptr;
+  AnalogDialRun *runs = nullptr;
+  uint32_t runCount = 0;
+};
+
+AnalogDialCache analogDialCache;
+lv_obj_t *digitalAirArc = nullptr;
+lv_obj_t *digitalAirStem = nullptr;
+lv_obj_t *digitalAirLeftLeg = nullptr;
+lv_obj_t *digitalAirRightLeg = nullptr;
+lv_obj_t *digitalMetricDivider = nullptr;
+lv_obj_t *digitalBottomDivider = nullptr;
 lv_obj_t *secondDots[SECOND_DOT_COUNT] = {};
 lv_obj_t *secondLineBackgroundArc = nullptr;
 lv_obj_t *secondLineFadeArc = nullptr;
@@ -98,6 +179,10 @@ bool secondFadeActive = false;
 unsigned long secondFadeStartedAt = 0;
 unsigned long lastSecondFadeFrameAt = 0;
 bool settingsVisible = false;
+bool suppressNextDashboardClick = false;
+unsigned long suppressDashboardClickUntil = 0;
+bool radarVisible = false;
+bool radarFeatureAvailable = true;
 bool nightModeEnabled = false;
 uint8_t nightVisualMode = CLOCK_NIGHT_VISUAL_RED;
 bool automaticDayNightEnabled = true;
@@ -113,11 +198,10 @@ uint32_t secondDotColor = 0xFFFFFF;
 uint32_t leftWeatherIconColor = 0xFFFFFF;
 uint32_t rightWeatherIconColor = 0xFFFFFF;
 uint8_t secondDotBrightness = 175;
-uint32_t outsideColor = 0x4CCBEC;
-uint32_t roomColor = 0xFFB843;
 uint32_t timeColor = 0xF6F6F6;
 uint32_t dateColor = 0xB5B5B5;
 uint8_t timeFont = CLOCK_TIME_FONT_BARLOW;
+uint8_t language = CLOCK_LANGUAGE_CZECH;
 bool outsideUsesWeatherIcon = true;
 bool roomUsesWeatherIcon = false;
 bool homeAssistantStatusRelevant = true;
@@ -169,6 +253,7 @@ bool weatherAnimationRevealPending = false;
 unsigned long weatherAnimationRevealAt = 0;
 bool firmwareUpdateActive = false;
 uint8_t settingsPageIndex = 0;
+uint8_t settingsSelectedClockStyle = CLOCK_STYLE_DIGITAL;
 uint8_t selectedWebMode = 0;
 bool automaticFirmwareUpdateEnabled = false;
 bool displayedCanInstall = false;
@@ -185,8 +270,12 @@ uint8_t timeColonEffect = CLOCK_TIME_COLON_STEADY;
 char displayedTimeText[6] = "--:--";
 uint32_t lastRenderedTimeColonColor = UINT32_MAX;
 ClockValues currentValues;
+ClockSideValueConfig leftValueConfig;
+ClockSideValueConfig rightValueConfig;
 ClockMetricConfig metricAConfig;
 ClockMetricConfig metricBConfig;
+ClockMetricColorScale leftValueColorScale;
+ClockMetricColorScale rightValueColorScale;
 ClockMetricColorScale metricAColorScale;
 ClockMetricColorScale metricBColorScale;
 BrightnessPreviewCallback brightnessPreviewCallback = nullptr;
@@ -195,6 +284,8 @@ SettingsSaveCallback settingsSaveCallback = nullptr;
 SettingsActionCallback firmwareCheckCallback = nullptr;
 SettingsActionCallback firmwareInstallCallback = nullptr;
 ShortClickAllowedCallback shortClickAllowedCallback = nullptr;
+RadarVisibilityCallback radarVisibilityCallback = nullptr;
+RadarRangeCallback radarRangeCallback = nullptr;
 
 bool redNightVisualEnabled() {
   return nightModeEnabled && nightVisualMode == CLOCK_NIGHT_VISUAL_RED;
@@ -209,6 +300,101 @@ const lv_font_t *configuredTimeFont() {
 }
 
 void showSettingsSubpage(uint8_t page);
+void updateClockStyleCardSelection();
+void alignCenter(lv_obj_t *object, int x, int y);
+void setTextColor(lv_obj_t *object, lv_color_t color);
+lv_obj_t *makeLabel(lv_obj_t *parent, const lv_font_t *font,
+                    lv_color_t color);
+
+bool englishLanguage() { return language == CLOCK_LANGUAGE_ENGLISH; }
+
+void applyDashboardLanguage() {
+  const bool english = englishLanguage();
+  if (clockStyleTitleLabel != nullptr)
+    lv_label_set_text(clockStyleTitleLabel,
+                      english ? "CLOCK TYPE" : "TYP HODIN");
+  if (digitalClockStyleLabel != nullptr)
+    lv_label_set_text(digitalClockStyleLabel,
+                      english ? "DIGITAL" : "DIGITÁLNÍ");
+  if (analogClockStyleLabel != nullptr)
+    lv_label_set_text(analogClockStyleLabel,
+                      english ? "ANALOG" : "ANALOGOVÉ");
+  if (dayBrightnessTitleLabel != nullptr)
+    lv_label_set_text(dayBrightnessTitleLabel,
+                      english ? "DAY BRIGHTNESS" : "DENNÍ JAS");
+  if (nightBrightnessTitleLabel != nullptr)
+    lv_label_set_text(nightBrightnessTitleLabel,
+                      english ? "NIGHT BRIGHTNESS" : "NOČNÍ JAS");
+  if (automaticDayNightTitleLabel != nullptr)
+    lv_label_set_text(automaticDayNightTitleLabel,
+                      english ? "AUTOMATIC DAY/NIGHT"
+                              : "AUTOMATICKY DEN/NOC");
+  if (weatherIconModeTitleLabel != nullptr)
+    lv_label_set_text(weatherIconModeTitleLabel,
+                      english ? "WEATHER ICONS" : "IKONY POČASÍ");
+  if (weatherIconModeDropdown != nullptr) {
+    const uint16_t selected = lv_dropdown_get_selected(weatherIconModeDropdown);
+    lv_dropdown_set_options(
+        weatherIconModeDropdown,
+        english ? "STATIC MONOCHROME\nANIMATED FLAT\nANIMATED LINE\nANIMATED MONOCHROME"
+                : "STATICKÉ MONOCHROMATICKÉ\nANIMOVANÉ FLAT\nANIMOVANÉ LINE\nANIMOVANÉ MONOCHROMATICKÉ");
+    lv_dropdown_set_selected(weatherIconModeDropdown, selected);
+  }
+  if (secondModeTitleLabel != nullptr)
+    lv_label_set_text(secondModeTitleLabel,
+                      english ? "SECONDS" : "VTEŘINY");
+  if (secondModeDropdown != nullptr) {
+    const uint16_t selected = lv_dropdown_get_selected(secondModeDropdown);
+    lv_dropdown_set_options(secondModeDropdown,
+                            english ? "OFF\nDOTS\nLINE\nCOMET"
+                                    : "VYPNUTO\nTEČKY\nLINKA\nKOMETA");
+    lv_dropdown_set_selected(secondModeDropdown, selected);
+  }
+  if (webModeDropdown != nullptr) {
+    const uint16_t selected = lv_dropdown_get_selected(webModeDropdown);
+    lv_dropdown_set_options(webModeDropdown,
+                            english ? "10 MINUTES\nALWAYS\nOFF"
+                                    : "10 MINUT\nVŽDY\nVYPNUTÝ");
+    lv_dropdown_set_selected(webModeDropdown, selected);
+  }
+  if (automaticUpdateTitleLabel != nullptr)
+    lv_label_set_text(automaticUpdateTitleLabel,
+                      english ? "AUTOMATIC OTA" : "AUTOMATICKÉ OTA");
+  if (firmwareCheckLabel != nullptr)
+    lv_label_set_text(firmwareCheckLabel,
+                      english ? "CHECK" : "ZKONTROLOVAT");
+  if (firmwareInstallLabel != nullptr)
+    lv_label_set_text(firmwareInstallLabel,
+                      english ? "UPDATE" : "AKTUALIZOVAT");
+  if (firmwareUpdateTitleLabel != nullptr)
+    lv_label_set_text(firmwareUpdateTitleLabel,
+                      english ? "FIRMWARE UPDATE"
+                              : "AKTUALIZACE FIRMWARE");
+  displayedDeviceInfo[0] = '\0';
+  displayedFirmwareStatus[0] = '\0';
+}
+
+void setRadarVisible(bool visible) {
+  if (visible && !radarFeatureAvailable) return;
+  if (radarVisible == visible || settingsVisible || radarPage == nullptr ||
+      dashboardContent == nullptr)
+    return;
+  radarVisible = visible;
+  if (visible) {
+    // Při návratu na radar neodkrývej snímek, který zůstal v canvasu z
+    // předchozího cyklu. Canvas znovu zobrazí až první snapshot nové animace.
+    lv_obj_add_flag(radarCanvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(radarProgressBar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(dashboardContent, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(radarPage);
+  } else {
+    lv_obj_add_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(dashboardContent, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(dashboardContent);
+  }
+  if (radarVisibilityCallback != nullptr) radarVisibilityCallback(visible);
+}
 
 void setObjectVisible(lv_obj_t *object, bool visible) {
   if (visible) {
@@ -245,18 +431,32 @@ void ensureWeatherAnimationDecoders() {
       weatherAnimationKey[0] == '\0') {
     return;
   }
-  if (outsideUsesWeatherIcon &&
-      strcmp(leftWeatherDecoderKey, weatherAnimationKey) != 0) {
-    lv_gif_set_src(weatherAnimation, &weatherAnimationSource);
-    strlcpy(leftWeatherDecoderKey, weatherAnimationKey,
-            sizeof(leftWeatherDecoderKey));
-  }
-  if (roomUsesWeatherIcon &&
-      strcmp(rightWeatherDecoderKey, weatherAnimationKey) != 0) {
-    lv_gif_set_src(roomWeatherAnimation, &weatherAnimationSource);
-    strlcpy(rightWeatherDecoderKey, weatherAnimationKey,
-            sizeof(rightWeatherDecoderKey));
-  }
+  auto updateDecoder = [](lv_obj_t *&decoder, char *decoderKey,
+                          size_t decoderKeySize, bool used, lv_coord_t x) {
+    if (used) {
+      if (strcmp(decoderKey, weatherAnimationKey) != 0) {
+        lv_gif_set_src(decoder, &weatherAnimationSource);
+        strlcpy(decoderKey, weatherAnimationKey, decoderKeySize);
+      }
+      return;
+    }
+    if (decoderKey[0] == '\0') return;
+
+    // Skrytí LVGL GIF objektu nezastaví jeho timer. Objekt proto před
+    // uvolněním starého assetu zrušíme a vytvoříme znovu bez zdroje.
+    lv_obj_t *parent = lv_obj_get_parent(decoder);
+    lv_obj_del(decoder);
+    decoder = lv_gif_create(parent);
+    alignCenter(decoder, analogLayoutEnabled() ? 0 : x,
+                analogLayoutEnabled() ? -70 : 107);
+    lv_obj_add_flag(decoder, LV_OBJ_FLAG_HIDDEN);
+    decoderKey[0] = '\0';
+  };
+
+  updateDecoder(weatherAnimation, leftWeatherDecoderKey,
+                sizeof(leftWeatherDecoderKey), outsideUsesWeatherIcon, -142);
+  updateDecoder(roomWeatherAnimation, rightWeatherDecoderKey,
+                sizeof(rightWeatherDecoderKey), roomUsesWeatherIcon, 142);
 }
 
 lv_color_t configuredColor(uint32_t color) {
@@ -267,6 +467,740 @@ lv_color_t configuredColor(uint32_t color) {
   const uint8_t green = static_cast<uint8_t>((color >> 8) & 0xFF);
   const uint8_t blue = static_cast<uint8_t>(color & 0xFF);
   return LV_COLOR_MAKE(red, green, blue);
+}
+
+lv_color_t analogTone(float intensity = 1.0f) {
+  intensity = constrain(intensity, 0.0f, 1.0f);
+  const uint8_t red = static_cast<uint8_t>(
+      ((analogToneColor >> 16) & 0xFF) * intensity);
+  const uint8_t green = static_cast<uint8_t>(
+      ((analogToneColor >> 8) & 0xFF) * intensity);
+  const uint8_t blue =
+      static_cast<uint8_t>((analogToneColor & 0xFF) * intensity);
+  return lv_color_make(red, green, blue);
+}
+
+lv_color_t analogHandTone(float intensity = 1.0f) {
+  intensity = constrain(intensity, 0.0f, 1.0f);
+  const uint8_t red = static_cast<uint8_t>(
+      ((analogHandToneColor >> 16) & 0xFF) * intensity);
+  const uint8_t green = static_cast<uint8_t>(
+      ((analogHandToneColor >> 8) & 0xFF) * intensity);
+  const uint8_t blue = static_cast<uint8_t>(
+      (analogHandToneColor & 0xFF) * intensity);
+  return lv_color_make(red, green, blue);
+}
+
+lv_point_t analogPoint(const lv_point_t &center, float angleDegrees,
+                       float radius) {
+  const float radians = angleDegrees * ANALOG_PI / 180.0f;
+  return {
+      static_cast<lv_coord_t>(center.x +
+                              std::round(std::sin(radians) * radius)),
+      static_cast<lv_coord_t>(center.y -
+                              std::round(std::cos(radians) * radius)),
+  };
+}
+
+struct AnalogDrawTarget {
+  lv_draw_ctx_t *context;
+  lv_obj_t *canvas;
+};
+
+void drawAnalogLine(const AnalogDrawTarget &target, const lv_point_t &from,
+                    const lv_point_t &to, lv_color_t color, lv_coord_t width,
+                    lv_opa_t opacity = LV_OPA_COVER) {
+  lv_draw_line_dsc_t descriptor;
+  lv_draw_line_dsc_init(&descriptor);
+  descriptor.color = color;
+  descriptor.width = width;
+  descriptor.opa = opacity;
+  descriptor.round_start = true;
+  descriptor.round_end = true;
+  if (target.canvas != nullptr) {
+    const lv_point_t points[] = {from, to};
+    lv_canvas_draw_line(target.canvas, points, 2, &descriptor);
+  } else {
+    lv_draw_line(target.context, &descriptor, &from, &to);
+  }
+}
+
+void drawAnalogCircle(const AnalogDrawTarget &target,
+                      const lv_point_t &center,
+                      lv_coord_t radius, lv_color_t color,
+                      lv_opa_t opacity = LV_OPA_COVER) {
+  lv_draw_rect_dsc_t descriptor;
+  lv_draw_rect_dsc_init(&descriptor);
+  descriptor.radius = LV_RADIUS_CIRCLE;
+  descriptor.bg_color = color;
+  descriptor.bg_opa = opacity;
+  descriptor.border_width = 0;
+  lv_area_t area = {
+      static_cast<lv_coord_t>(center.x - radius),
+      static_cast<lv_coord_t>(center.y - radius),
+      static_cast<lv_coord_t>(center.x + radius),
+      static_cast<lv_coord_t>(center.y + radius),
+  };
+  if (target.canvas != nullptr) {
+    lv_canvas_draw_rect(target.canvas, area.x1, area.y1,
+                        lv_area_get_width(&area), lv_area_get_height(&area),
+                        &descriptor);
+  } else {
+    lv_draw_rect(target.context, &descriptor, &area);
+  }
+}
+
+void drawAnalogArc(const AnalogDrawTarget &target, const lv_point_t &center,
+                   uint16_t radius, lv_color_t color, lv_coord_t width,
+                   lv_opa_t opacity = LV_OPA_COVER) {
+  lv_draw_arc_dsc_t descriptor;
+  lv_draw_arc_dsc_init(&descriptor);
+  descriptor.color = color;
+  descriptor.width = width;
+  descriptor.opa = opacity;
+  descriptor.rounded = true;
+  if (target.canvas != nullptr) {
+    lv_canvas_draw_arc(target.canvas, center.x, center.y, radius, 0, 360,
+                       &descriptor);
+  } else {
+    lv_draw_arc(target.context, &descriptor, &center, radius, 0, 360);
+  }
+}
+
+void drawAnalogArcSegment(const AnalogDrawTarget &target,
+                          const lv_point_t &center, uint16_t radius,
+                          float startAngleDegrees, float endAngleDegrees,
+                          lv_color_t color, lv_coord_t width) {
+  const auto lvglAngle = [](float analogAngle) -> uint16_t {
+    int angle = static_cast<int>(std::round(analogAngle - 90.0f)) % 360;
+    if (angle < 0) angle += 360;
+    return static_cast<uint16_t>(angle);
+  };
+  lv_draw_arc_dsc_t descriptor;
+  lv_draw_arc_dsc_init(&descriptor);
+  descriptor.color = color;
+  descriptor.width = width;
+  descriptor.opa = LV_OPA_COVER;
+  descriptor.rounded = true;
+  const uint16_t startAngle = lvglAngle(startAngleDegrees);
+  const uint16_t endAngle = lvglAngle(endAngleDegrees);
+  if (target.canvas != nullptr) {
+    lv_canvas_draw_arc(target.canvas, center.x, center.y, radius, startAngle,
+                       endAngle, &descriptor);
+  } else {
+    lv_draw_arc(target.context, &descriptor, &center, radius, startAngle,
+                endAngle);
+  }
+}
+
+void drawAnalogRadialLine(const AnalogDrawTarget &target,
+                          const lv_point_t &center, float angleDegrees,
+                          float innerRadius, float outerRadius,
+                          lv_color_t color, lv_coord_t width,
+                          lv_opa_t opacity = LV_OPA_COVER) {
+  const lv_point_t from = analogPoint(center, angleDegrees, innerRadius);
+  const lv_point_t to = analogPoint(center, angleDegrees, outerRadius);
+  drawAnalogLine(target, from, to, color, width, opacity);
+}
+
+void drawAnalogHand(const AnalogDrawTarget &target, const lv_point_t &center,
+                    float angleDegrees, float rearLength, float frontLength,
+                    lv_coord_t outlineWidth, lv_coord_t edgeWidth,
+                    lv_coord_t coreWidth) {
+  const lv_coord_t outlineSideOffset =
+      max(static_cast<lv_coord_t>(3),
+          static_cast<lv_coord_t>(edgeWidth / 2 - 1));
+  const float effectiveRearLength =
+      rearLength + (analogOutlineHandsEnabled ? outlineSideOffset : 0);
+  const lv_point_t from =
+      analogPoint(center, angleDegrees + 180.0f, effectiveRearLength);
+  const lv_point_t to = analogPoint(center, angleDegrees, frontLength);
+  const lv_color_t outline = redNightVisualEnabled()
+                                 ? lv_color_make(48, 0, 0)
+                                 : lv_color_make(4, 14, 24);
+  const lv_color_t edge = redNightVisualEnabled()
+                              ? COLOR_ERROR
+                              : analogHandTone(0.88f);
+  const lv_color_t core = redNightVisualEnabled()
+                              ? lv_color_make(255, 112, 112)
+                              : lv_color_make(246, 250, 252);
+  if (analogOutlineHandsEnabled) {
+    const lv_color_t outlineColor =
+        redNightVisualEnabled() ? COLOR_ERROR : analogHandTone();
+    const lv_coord_t sideOffset = outlineSideOffset;
+    const lv_point_t leftFrom =
+        analogPoint(from, angleDegrees - 90.0f, sideOffset);
+    const lv_point_t leftTo =
+        analogPoint(to, angleDegrees - 90.0f, sideOffset);
+    const lv_point_t rightFrom =
+        analogPoint(from, angleDegrees + 90.0f, sideOffset);
+    const lv_point_t rightTo =
+        analogPoint(to, angleDegrees + 90.0f, sideOffset);
+
+    drawAnalogLine(target, leftFrom, leftTo, outlineColor, 4);
+    drawAnalogLine(target, rightFrom, rightTo, outlineColor, 4);
+    drawAnalogArcSegment(target, to, sideOffset, angleDegrees - 90.0f,
+                         angleDegrees + 90.0f, outlineColor, 4);
+    drawAnalogLine(target, leftFrom, rightFrom, outlineColor, 4);
+    return;
+  }
+  drawAnalogLine(target, from, to, outline, outlineWidth);
+  drawAnalogLine(target, from, to, edge, edgeWidth);
+  drawAnalogLine(target, from, to, core, coreWidth);
+}
+
+void renderAnalogDial(const AnalogDrawTarget &target,
+                      const lv_point_t &center) {
+  const bool redNight = redNightVisualEnabled();
+  const lv_color_t cyan = redNight ? COLOR_ERROR : analogTone();
+  const lv_color_t amber =
+      redNight ? COLOR_ERROR : configuredColor(analogCardinalAccentColor);
+  const lv_color_t markerCore =
+      redNight ? lv_color_make(255, 112, 112) : COLOR_TEXT;
+  const lv_color_t markerEdge = redNight ? COLOR_ERROR : analogTone(0.75f);
+
+  drawAnalogCircle(target, center, 239,
+                   redNight ? lv_color_make(10, 0, 0)
+                            : lv_color_make(0, 7, 16));
+  drawAnalogCircle(target, center, 216,
+                   redNight ? lv_color_make(15, 0, 0)
+                            : lv_color_make(0, 10, 20));
+  drawAnalogArc(target, center, 239,
+                redNight ? lv_color_make(58, 14, 14)
+                         : lv_color_make(17, 35, 52),
+                6);
+  drawAnalogArc(target, center, ANALOG_RING_RADIUS, cyan, 3,
+                redNight ? LV_OPA_70 : LV_OPA_COVER);
+
+  for (int minute = 0; minute < 60; ++minute) {
+    if (minute % 5 == 0) continue;
+    drawAnalogRadialLine(target, center, minute * 6.0f, 225.0f, 232.0f,
+                         markerCore, 2, redNight ? LV_OPA_60 : LV_OPA_80);
+  }
+
+  for (int hour = 0; hour < 12; ++hour) {
+    const float angle = hour * 30.0f;
+    drawAnalogRadialLine(target, center, angle, 206.0f, 232.0f,
+                         lv_color_make(2, 15, 27), 15);
+    drawAnalogRadialLine(target, center, angle, 206.0f, 232.0f,
+                         markerEdge, 11);
+    drawAnalogRadialLine(target, center, angle, 207.0f, 231.0f,
+                         markerCore, 7);
+  }
+
+  if (analogCardinalAccentsEnabled) {
+    // Čtyři shodné akcenty vznikají ze stejného úhlového rozsahu. Nejde o
+    // samostatně odhadnuté souřadnice, takže jsou na 12/3/6/9 stejně dlouhé.
+    for (int cardinal = 0; cardinal < 4; ++cardinal) {
+      const float centerAngle = cardinal * 90.0f;
+      const lv_point_t from =
+          analogPoint(center, centerAngle - 5.0f, ANALOG_RING_RADIUS);
+      const lv_point_t to =
+          analogPoint(center, centerAngle + 5.0f, ANALOG_RING_RADIUS);
+      drawAnalogLine(target, from, to, amber, 7);
+    }
+  }
+
+  drawAnalogLine(target,
+                 {static_cast<lv_coord_t>(center.x - 38),
+                  static_cast<lv_coord_t>(center.y - 151)},
+                 {static_cast<lv_coord_t>(center.x + 38),
+                  static_cast<lv_coord_t>(center.y - 151)},
+                 cyan, 2, LV_OPA_80);
+  drawAnalogLine(target,
+                 {static_cast<lv_coord_t>(center.x - 38),
+                  static_cast<lv_coord_t>(center.y - 112)},
+                 {static_cast<lv_coord_t>(center.x + 38),
+                  static_cast<lv_coord_t>(center.y - 112)},
+                 cyan, 2, LV_OPA_80);
+}
+
+void drawCachedAnalogDial(lv_draw_ctx_t *drawContext,
+                          const lv_area_t &coordinates) {
+  if (analogDialCache.rowOffsets == nullptr ||
+      analogDialCache.runs == nullptr) {
+    const lv_point_t center = {
+        static_cast<lv_coord_t>(coordinates.x1 + ANALOG_CENTER_X),
+        static_cast<lv_coord_t>(coordinates.y1 + ANALOG_CENTER_Y),
+    };
+    renderAnalogDial({drawContext, nullptr}, center);
+    return;
+  }
+
+  lv_area_t clipped;
+  if (!_lv_area_intersect(&clipped, drawContext->clip_area, &coordinates))
+    return;
+  const lv_coord_t stride = lv_area_get_width(drawContext->buf_area);
+  auto *destination = static_cast<lv_color_t *>(drawContext->buf);
+
+  for (lv_coord_t y = clipped.y1; y <= clipped.y2; ++y) {
+    const uint16_t sourceY = static_cast<uint16_t>(y - coordinates.y1);
+    const uint16_t wantedStart =
+        static_cast<uint16_t>(clipped.x1 - coordinates.x1);
+    const uint16_t wantedEnd =
+        static_cast<uint16_t>(clipped.x2 - coordinates.x1);
+    uint16_t runStart = 0;
+    for (uint32_t runIndex = analogDialCache.rowOffsets[sourceY];
+         runIndex < analogDialCache.rowOffsets[sourceY + 1]; ++runIndex) {
+      const AnalogDialRun &run = analogDialCache.runs[runIndex];
+      const uint16_t runEnd = runStart + run.length - 1;
+      if (runEnd >= wantedStart && runStart <= wantedEnd) {
+        const uint16_t copyStart = max(runStart, wantedStart);
+        const uint16_t copyEnd = min(runEnd, wantedEnd);
+        lv_color_t *row = destination +
+            (y - drawContext->buf_area->y1) * stride -
+            drawContext->buf_area->x1;
+        for (uint16_t x = copyStart; x <= copyEnd; ++x)
+          row[coordinates.x1 + x] = run.color;
+      }
+      runStart = runEnd + 1;
+      if (runStart > wantedEnd) break;
+    }
+  }
+}
+
+void drawAnalogDialEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) return;
+  lv_area_t coordinates;
+  lv_obj_get_coords(lv_event_get_target(event), &coordinates);
+  drawCachedAnalogDial(lv_event_get_draw_ctx(event), coordinates);
+}
+
+void drawAnalogHandsEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) return;
+  int hour = 0;
+  int minute = 0;
+  if (sscanf(displayedTimeText, "%d:%d", &hour, &minute) != 2) return;
+
+  lv_draw_ctx_t *drawContext = lv_event_get_draw_ctx(event);
+  lv_area_t coordinates;
+  lv_obj_get_coords(lv_event_get_target(event), &coordinates);
+  const lv_point_t center = {
+      static_cast<lv_coord_t>(coordinates.x1 + ANALOG_CENTER_X),
+      static_cast<lv_coord_t>(coordinates.y1 + ANALOG_CENTER_Y),
+  };
+  const uint8_t second = displayedSecond > 59 ? 0 : displayedSecond;
+  const float hourAngle =
+      (hour % 12) * 30.0f + minute * 0.5f + second / 120.0f;
+  const float minuteAngle = minute * 6.0f + second * 0.1f;
+  const float secondAngle = second * 6.0f;
+  const AnalogDrawTarget target = {drawContext, nullptr};
+
+  // Ručičky se kreslí až nad texty. Delší provedení záměrně překrývá údaje,
+  // stejně jako skutečné ručičky nad potištěným ciferníkem.
+  drawAnalogHand(target, center, hourAngle, 16.0f, 145.0f, 21, 15, 9);
+  drawAnalogHand(target, center, minuteAngle, 20.0f, 178.0f, 17, 12, 7);
+
+  const lv_point_t secondFrom = analogPoint(center, secondAngle + 180.0f, 34.0f);
+  const lv_point_t secondTo = analogPoint(center, secondAngle, 192.0f);
+  drawAnalogLine(target, secondFrom, secondTo,
+                 redNightVisualEnabled() ? COLOR_ERROR : analogHandTone(),
+                 3);
+
+  drawAnalogCircle(target, center, 18,
+                   redNightVisualEnabled() ? lv_color_make(48, 0, 0)
+                                           : lv_color_make(3, 16, 27));
+  drawAnalogCircle(target, center, 13,
+                   redNightVisualEnabled() ? COLOR_ERROR
+                                           : analogHandTone(0.9f));
+  drawAnalogCircle(target, center, 8,
+                   redNightVisualEnabled() ? lv_color_make(255, 112, 112)
+                                           : COLOR_TEXT);
+  drawAnalogCircle(target, center, 4,
+                   redNightVisualEnabled() ? lv_color_make(62, 0, 0)
+                                           : lv_color_make(0, 35, 50));
+}
+
+lv_obj_t *makeAnalogLayer(lv_obj_t *parent, lv_event_cb_t drawCallback) {
+  lv_obj_t *layer = lv_obj_create(parent);
+  lv_obj_set_size(layer, 480, 480);
+  lv_obj_set_pos(layer, 0, 0);
+  lv_obj_set_style_bg_opa(layer, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(layer, 0, 0);
+  lv_obj_set_style_pad_all(layer, 0, 0);
+  lv_obj_set_style_radius(layer, 0, 0);
+  lv_obj_clear_flag(layer, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(layer, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(layer, drawCallback, LV_EVENT_DRAW_MAIN, nullptr);
+  return layer;
+}
+
+void clearAnalogDialCache() {
+  if (analogDialCache.rowOffsets != nullptr)
+    heap_caps_free(analogDialCache.rowOffsets);
+  if (analogDialCache.runs != nullptr)
+    heap_caps_free(analogDialCache.runs);
+  analogDialCache = {};
+}
+
+bool rebuildAnalogDialCache() {
+  constexpr size_t PIXEL_COUNT = 480U * 480U;
+  auto *pixels = static_cast<lv_color_t *>(heap_caps_malloc(
+      PIXEL_COUNT * sizeof(lv_color_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (pixels == nullptr) {
+    clearAnalogDialCache();
+    return false;
+  }
+
+  lv_obj_t *canvas = lv_canvas_create(lv_layer_sys());
+  lv_obj_add_flag(canvas, LV_OBJ_FLAG_HIDDEN);
+  lv_canvas_set_buffer(canvas, pixels, 480, 480, LV_IMG_CF_TRUE_COLOR);
+  lv_canvas_fill_bg(canvas, COLOR_BACKGROUND, LV_OPA_COVER);
+  renderAnalogDial({nullptr, canvas}, {ANALOG_CENTER_X, ANALOG_CENTER_Y});
+
+  uint32_t runCount = 0;
+  for (uint16_t y = 0; y < 480; ++y) {
+    const lv_color_t *row = pixels + static_cast<size_t>(y) * 480U;
+    ++runCount;
+    for (uint16_t x = 1; x < 480; ++x) {
+      if (row[x].full != row[x - 1].full) ++runCount;
+    }
+  }
+
+  auto *newOffsets = static_cast<uint32_t *>(heap_caps_malloc(
+      481U * sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  auto *newRuns = static_cast<AnalogDialRun *>(heap_caps_malloc(
+      static_cast<size_t>(runCount) * sizeof(AnalogDialRun),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (newOffsets == nullptr || newRuns == nullptr) {
+    if (newOffsets != nullptr) heap_caps_free(newOffsets);
+    if (newRuns != nullptr) heap_caps_free(newRuns);
+    lv_obj_del(canvas);
+    heap_caps_free(pixels);
+    clearAnalogDialCache();
+    return false;
+  }
+
+  uint32_t runIndex = 0;
+  for (uint16_t y = 0; y < 480; ++y) {
+    newOffsets[y] = runIndex;
+    const lv_color_t *row = pixels + static_cast<size_t>(y) * 480U;
+    uint16_t runStart = 0;
+    for (uint16_t x = 1; x <= 480; ++x) {
+      if (x == 480 || row[x].full != row[runStart].full) {
+        newRuns[runIndex++] = {
+            static_cast<uint16_t>(x - runStart), row[runStart]};
+        runStart = x;
+      }
+    }
+  }
+  newOffsets[480] = runIndex;
+
+  lv_obj_del(canvas);
+  heap_caps_free(pixels);
+  clearAnalogDialCache();
+  analogDialCache.rowOffsets = newOffsets;
+  analogDialCache.runs = newRuns;
+  analogDialCache.runCount = runIndex;
+  Serial.printf("[analog] Cache ciferniku: %lu behu, %lu B PSRAM\n",
+                static_cast<unsigned long>(runIndex),
+                static_cast<unsigned long>(
+                    481U * sizeof(uint32_t) +
+                    static_cast<size_t>(runIndex) * sizeof(AnalogDialRun)));
+  return true;
+}
+
+bool analogHandAnglesForSecond(uint8_t second, float &hourAngle,
+                               float &minuteAngle, float &secondAngle) {
+  int hour = 0;
+  int minute = 0;
+  if (sscanf(displayedTimeText, "%d:%d", &hour, &minute) != 2) return false;
+  if (second > 59) second = 0;
+  hourAngle = (hour % 12) * 30.0f + minute * 0.5f + second / 120.0f;
+  minuteAngle = minute * 6.0f + second * 0.1f;
+  secondAngle = second * 6.0f;
+  return true;
+}
+
+bool analogHandAngles(float &hourAngle, float &minuteAngle,
+                      float &secondAngle) {
+  return analogHandAnglesForSecond(displayedSecond, hourAngle, minuteAngle,
+                                   secondAngle);
+}
+
+bool analogHandGeometryChanged(float oldAngle, float newAngle,
+                               float rearLength, float frontLength,
+                               lv_coord_t edgeWidth) {
+  const lv_point_t center = {0, 0};
+  const lv_coord_t sideOffset =
+      max(static_cast<lv_coord_t>(3),
+          static_cast<lv_coord_t>(edgeWidth / 2 - 1));
+  const float effectiveRearLength =
+      rearLength + (analogOutlineHandsEnabled ? sideOffset : 0);
+  const lv_point_t oldFrom =
+      analogPoint(center, oldAngle + 180.0f, effectiveRearLength);
+  const lv_point_t oldTo = analogPoint(center, oldAngle, frontLength);
+  const lv_point_t newFrom =
+      analogPoint(center, newAngle + 180.0f, effectiveRearLength);
+  const lv_point_t newTo = analogPoint(center, newAngle, frontLength);
+  if (oldFrom.x != newFrom.x || oldFrom.y != newFrom.y ||
+      oldTo.x != newTo.x || oldTo.y != newTo.y) {
+    return true;
+  }
+  if (!analogOutlineHandsEnabled) return false;
+
+  const lv_point_t oldLeftFrom =
+      analogPoint(oldFrom, oldAngle - 90.0f, sideOffset);
+  const lv_point_t oldLeftTo =
+      analogPoint(oldTo, oldAngle - 90.0f, sideOffset);
+  const lv_point_t oldRightFrom =
+      analogPoint(oldFrom, oldAngle + 90.0f, sideOffset);
+  const lv_point_t oldRightTo =
+      analogPoint(oldTo, oldAngle + 90.0f, sideOffset);
+  const lv_point_t newLeftFrom =
+      analogPoint(newFrom, newAngle - 90.0f, sideOffset);
+  const lv_point_t newLeftTo =
+      analogPoint(newTo, newAngle - 90.0f, sideOffset);
+  const lv_point_t newRightFrom =
+      analogPoint(newFrom, newAngle + 90.0f, sideOffset);
+  const lv_point_t newRightTo =
+      analogPoint(newTo, newAngle + 90.0f, sideOffset);
+  return oldLeftFrom.x != newLeftFrom.x || oldLeftFrom.y != newLeftFrom.y ||
+         oldLeftTo.x != newLeftTo.x || oldLeftTo.y != newLeftTo.y ||
+         oldRightFrom.x != newRightFrom.x ||
+         oldRightFrom.y != newRightFrom.y || oldRightTo.x != newRightTo.x ||
+         oldRightTo.y != newRightTo.y ||
+         static_cast<int>(std::round(oldAngle)) !=
+             static_cast<int>(std::round(newAngle));
+}
+
+void invalidateAnalogHandArea(float angle, float rearLength,
+                              float frontLength, lv_coord_t width) {
+  if (!analogLayoutEnabled() || analogHandsLayer == nullptr) return;
+  lv_area_t coordinates;
+  lv_obj_get_coords(analogHandsLayer, &coordinates);
+  const lv_point_t center = {
+      static_cast<lv_coord_t>(coordinates.x1 + ANALOG_CENTER_X),
+      static_cast<lv_coord_t>(coordinates.y1 + ANALOG_CENTER_Y),
+  };
+  const lv_point_t from = analogPoint(center, angle + 180.0f, rearLength);
+  const lv_point_t to = analogPoint(center, angle, frontLength);
+  const lv_coord_t margin = width / 2 + 3;
+  const float deltaX = static_cast<float>(to.x - from.x);
+  const float deltaY = static_cast<float>(to.y - from.y);
+  const bool splitAlongX = std::fabs(deltaX) >= std::fabs(deltaY);
+  const float axisFrom = splitAlongX ? from.x : from.y;
+  const float axisTo = splitAlongX ? to.x : to.y;
+  const float otherFrom = splitAlongX ? from.y : from.x;
+  const float otherTo = splitAlongX ? to.y : to.x;
+  const float axisDelta = axisTo - axisFrom;
+  const float otherDelta = otherTo - otherFrom;
+  const lv_coord_t lineAxisMin = min(axisFrom, axisTo);
+  const lv_coord_t lineAxisMax = max(axisFrom, axisTo);
+  const lv_coord_t dirtyAxisMin = lineAxisMin - margin;
+  const lv_coord_t dirtyAxisMax = lineAxisMax + margin;
+  const lv_coord_t firstStrip =
+      (dirtyAxisMin / ANALOG_HAND_INVALIDATION_STRIP) *
+      ANALOG_HAND_INVALIDATION_STRIP;
+
+  auto otherCoordinate = [&](float axis) {
+    if (std::fabs(axisDelta) < 0.001f) return otherFrom;
+    return otherFrom + (axis - axisFrom) * otherDelta / axisDelta;
+  };
+
+  for (lv_coord_t stripStart = firstStrip; stripStart <= dirtyAxisMax;
+       stripStart += ANALOG_HAND_INVALIDATION_STRIP) {
+    const lv_coord_t stripEnd =
+        stripStart + ANALOG_HAND_INVALIDATION_STRIP - 1;
+    const lv_coord_t areaAxisMin = max(dirtyAxisMin, stripStart);
+    const lv_coord_t areaAxisMax = min(dirtyAxisMax, stripEnd);
+    const float sampleAxisMin =
+        constrain(static_cast<float>(areaAxisMin),
+                  static_cast<float>(lineAxisMin),
+                  static_cast<float>(lineAxisMax));
+    const float sampleAxisMax =
+        constrain(static_cast<float>(areaAxisMax),
+                  static_cast<float>(lineAxisMin),
+                  static_cast<float>(lineAxisMax));
+    const float otherAtMin = otherCoordinate(sampleAxisMin);
+    const float otherAtMax = otherCoordinate(sampleAxisMax);
+    const lv_coord_t areaOtherMin = static_cast<lv_coord_t>(
+        std::floor(min(otherAtMin, otherAtMax) - margin));
+    const lv_coord_t areaOtherMax = static_cast<lv_coord_t>(
+        std::ceil(max(otherAtMin, otherAtMax) + margin));
+
+    lv_area_t area;
+    if (splitAlongX) {
+      area = {areaAxisMin, areaOtherMin, areaAxisMax, areaOtherMax};
+    } else {
+      area = {areaOtherMin, areaAxisMin, areaOtherMax, areaAxisMax};
+    }
+    lv_obj_invalidate_area(analogHandsLayer, &area);
+  }
+}
+
+void invalidateAnalogHands(bool hourAndMinute = true,
+                           bool second = true) {
+  float hourAngle = 0.0f;
+  float minuteAngle = 0.0f;
+  float secondAngle = 0.0f;
+  if (!analogHandAngles(hourAngle, minuteAngle, secondAngle)) return;
+  if (hourAndMinute) {
+    invalidateAnalogHandArea(hourAngle, 22.0f, 145.0f, 21);
+    invalidateAnalogHandArea(minuteAngle, 25.0f, 178.0f, 17);
+  }
+  if (second) invalidateAnalogHandArea(secondAngle, 34.0f, 192.0f, 3);
+}
+
+void drawAnalogOutlinedLabelEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN_BEGIN ||
+      !analogLayoutEnabled() || !analogValuesAboveHandsEnabled) {
+    return;
+  }
+
+  lv_obj_t *label = lv_event_get_target(event);
+  lv_draw_ctx_t *drawContext = lv_event_get_draw_ctx(event);
+  lv_draw_label_dsc_t descriptor;
+  lv_draw_label_dsc_init(&descriptor);
+  lv_obj_init_draw_label_dsc(label, LV_PART_MAIN, &descriptor);
+  descriptor.color = COLOR_BACKGROUND;
+  descriptor.opa = LV_OPA_COVER;
+  descriptor.flag = LV_TEXT_FLAG_FIT;
+
+  lv_area_t coordinates;
+  lv_obj_get_content_coords(label, &coordinates);
+  static constexpr int8_t OFFSETS[][2] = {
+      {-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+      {1, 0},   {-1, 1}, {0, 1},  {1, 1},
+  };
+  const char *text = lv_label_get_text(label);
+  for (const auto &offset : OFFSETS) {
+    lv_area_t outlineCoordinates = coordinates;
+    lv_area_move(&outlineCoordinates, offset[0], offset[1]);
+    lv_draw_label(drawContext, &descriptor, &outlineCoordinates, text, nullptr);
+  }
+}
+
+void updateAnalogValueLayerOrder() {
+  if (analogHandsLayer == nullptr) return;
+  lv_obj_move_foreground(analogHandsLayer);
+  if (!analogValuesAboveHandsEnabled) return;
+
+  lv_obj_t *labels[] = {
+      analogOutsideTitleLabel,
+      analogOutsideValueLabel,
+      analogOutsideDecimalLabel,
+      analogOutsideUnitLabel,
+      analogRoomTitleLabel,
+      analogRoomValueLabel,
+      analogRoomDecimalLabel,
+      analogRoomUnitLabel,
+      analogMetricATitleLabel,
+      analogMetricAValueLabel,
+      analogMetricAUnitLabel,
+      analogMetricBTitleLabel,
+      analogMetricBValueLabel,
+      analogMetricBUnitLabel,
+  };
+  for (lv_obj_t *label : labels) lv_obj_move_foreground(label);
+}
+
+void createAnalogLayout(lv_obj_t *content) {
+  analogDialLayer = makeAnalogLayer(content, drawAnalogDialEvent);
+  lv_obj_move_background(analogDialLayer);
+  rebuildAnalogDialCache();
+
+  lv_obj_t *digitalOnly[] = {
+      timeLabel,          outsideTitleLabel,   outsideIntegerLabel,
+      outsideDecimalLabel, outsideUnitLabel,   roomTitleLabel,
+      roomIntegerLabel,   roomDecimalLabel,    roomUnitLabel,
+      outsideIconLabel,   co2TitleLabel,       co2ValueLabel,
+      co2UnitLabel,       humidityTitleLabel,  humidityValueLabel,
+      humidityUnitLabel,  roomWeatherImage,    weatherAnimation,
+      roomWeatherAnimation, roomIconLabel,
+  };
+  if (analogLayoutEnabled()) {
+    for (lv_obj_t *object : digitalOnly)
+      lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  lv_obj_set_style_text_font(dateLabel, &clock_czech_20, 0);
+  lv_obj_set_style_text_letter_space(dateLabel, 3, 0);
+  alignCenter(dateLabel, 0, -132);
+
+  analogOutsideTitleLabel = makeLabel(content, &clock_czech_20, COLOR_OUTSIDE);
+  lv_obj_set_style_text_letter_space(analogOutsideTitleLabel, 1, 0);
+  alignCenter(analogOutsideTitleLabel, -112, -8);
+  analogOutsideValueLabel =
+      makeLabel(content, &lv_font_montserrat_36, COLOR_OUTSIDE);
+  analogOutsideDecimalLabel =
+      makeLabel(content, &lv_font_montserrat_28, COLOR_OUTSIDE);
+  analogOutsideUnitLabel =
+      makeLabel(content, &clock_unit_28, COLOR_OUTSIDE);
+
+  analogRoomTitleLabel = makeLabel(content, &clock_czech_20, COLOR_ROOM);
+  lv_obj_set_style_text_letter_space(analogRoomTitleLabel, 1, 0);
+  alignCenter(analogRoomTitleLabel, 112, -8);
+  analogRoomValueLabel =
+      makeLabel(content, &lv_font_montserrat_36, COLOR_ROOM);
+  analogRoomDecimalLabel =
+      makeLabel(content, &lv_font_montserrat_28, COLOR_ROOM);
+  analogRoomUnitLabel = makeLabel(content, &clock_unit_28, COLOR_ROOM);
+
+  analogMetricATitleLabel = makeLabel(content, &clock_czech_16, COLOR_AIR);
+  analogMetricAValueLabel =
+      makeLabel(content, &lv_font_montserrat_32, COLOR_AIR);
+  analogMetricAUnitLabel = makeLabel(content, &clock_czech_16, COLOR_AIR);
+
+  analogMetricBTitleLabel =
+      makeLabel(content, &clock_czech_16, COLOR_HUMIDITY);
+  analogMetricBValueLabel =
+      makeLabel(content, &lv_font_montserrat_32, COLOR_HUMIDITY);
+  analogMetricBUnitLabel =
+      makeLabel(content, &clock_czech_16, COLOR_HUMIDITY);
+
+  analogMetricDivider = lv_obj_create(content);
+  lv_obj_set_size(analogMetricDivider, 138, 2);
+  lv_obj_set_style_radius(analogMetricDivider, 1, 0);
+  lv_obj_set_style_border_width(analogMetricDivider, 0, 0);
+  lv_obj_set_style_bg_color(analogMetricDivider, analogTone(), 0);
+  lv_obj_set_style_bg_opa(analogMetricDivider, LV_OPA_80, 0);
+  lv_obj_clear_flag(analogMetricDivider, LV_OBJ_FLAG_SCROLLABLE);
+  alignCenter(analogMetricDivider, 0, 120);
+
+  lv_img_set_zoom(weatherImage, 256);
+  alignCenter(weatherImage, 0, -70);
+  alignCenter(weatherAnimation, 0, -70);
+
+  analogHandsLayer = makeAnalogLayer(content, drawAnalogHandsEvent);
+  lv_obj_move_foreground(analogHandsLayer);
+  lv_obj_t *outlinedLabels[] = {
+      analogOutsideTitleLabel,
+      analogOutsideValueLabel,
+      analogOutsideDecimalLabel,
+      analogOutsideUnitLabel,
+      analogRoomTitleLabel,
+      analogRoomValueLabel,
+      analogRoomDecimalLabel,
+      analogRoomUnitLabel,
+      analogMetricATitleLabel,
+      analogMetricAValueLabel,
+      analogMetricAUnitLabel,
+      analogMetricBTitleLabel,
+      analogMetricBValueLabel,
+      analogMetricBUnitLabel,
+  };
+  for (lv_obj_t *label : outlinedLabels) {
+    lv_obj_add_event_cb(label, drawAnalogOutlinedLabelEvent,
+                        LV_EVENT_DRAW_MAIN_BEGIN, nullptr);
+  }
+  updateAnalogValueLayerOrder();
+  if (!analogLayoutEnabled()) {
+    lv_obj_t *analogOnly[] = {
+        analogDialLayer,          analogHandsLayer,
+        analogOutsideTitleLabel, analogOutsideValueLabel,
+        analogOutsideDecimalLabel, analogOutsideUnitLabel,
+        analogRoomTitleLabel,    analogRoomValueLabel,
+        analogRoomDecimalLabel,  analogRoomUnitLabel,
+        analogMetricATitleLabel, analogMetricAValueLabel,
+        analogMetricAUnitLabel,  analogMetricBTitleLabel,
+        analogMetricBValueLabel, analogMetricBUnitLabel,
+        analogMetricDivider,
+    };
+    for (lv_obj_t *object : analogOnly)
+      lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 
 lv_color_t interpolateColor(uint32_t from, uint32_t to, float progress) {
@@ -317,8 +1251,209 @@ void alignCenter(lv_obj_t *object, int x, int y) {
   lv_obj_align(object, LV_ALIGN_CENTER, x, y);
 }
 
+void alignAnalogValue(lv_obj_t *valueLabel, lv_obj_t *unitLabel, int centerX,
+                      int centerY) {
+  lv_obj_update_layout(valueLabel);
+  lv_obj_update_layout(unitLabel);
+  constexpr int UNIT_GAP = 6;
+  const int totalWidth = lv_obj_get_width(valueLabel) + UNIT_GAP +
+                         lv_obj_get_width(unitLabel);
+  const int left = centerX - totalWidth / 2;
+  lv_obj_align(valueLabel, LV_ALIGN_CENTER,
+               left + lv_obj_get_width(valueLabel) / 2, centerY);
+  lv_obj_align(unitLabel, LV_ALIGN_CENTER,
+               left + lv_obj_get_width(valueLabel) + UNIT_GAP +
+                   lv_obj_get_width(unitLabel) / 2,
+               centerY + 5);
+}
+
+bool setLabelTextIfChanged(lv_obj_t *label, const char *text) {
+  if (strcmp(lv_label_get_text(label), text) == 0) return false;
+  lv_label_set_text(label, text);
+  return true;
+}
+
+bool setAnalogValue(lv_obj_t *valueLabel, lv_obj_t *unitLabel, float value,
+                    uint8_t decimals, const char *unit, int centerX,
+                    int centerY) {
+  char valueText[20];
+  if (std::isnan(value)) {
+    strlcpy(valueText, "--", sizeof(valueText));
+  } else {
+    snprintf(valueText, sizeof(valueText), "%.*f", constrain(decimals, 0, 2),
+             value);
+    char *decimalPoint = strchr(valueText, '.');
+    if (decimalPoint != nullptr) *decimalPoint = ',';
+  }
+  const bool changed = setLabelTextIfChanged(valueLabel, valueText) |
+                       setLabelTextIfChanged(unitLabel, unit);
+  if (changed) alignAnalogValue(valueLabel, unitLabel, centerX, centerY);
+  return changed;
+}
+
+void setAnalogTemperature(lv_obj_t *integerLabel, lv_obj_t *decimalLabel,
+                          lv_obj_t *unitLabel, float value, uint8_t decimals,
+                          const char *unit, int centerX, int centerY) {
+  char integerText[20];
+  char decimalText[8] = "";
+  if (std::isnan(value)) {
+    strlcpy(integerText, "--", sizeof(integerText));
+  } else {
+    char valueText[20];
+    snprintf(valueText, sizeof(valueText), "%.*f", constrain(decimals, 0, 2),
+             value);
+    char *decimalPoint = strchr(valueText, '.');
+    if (decimalPoint != nullptr) {
+      snprintf(decimalText, sizeof(decimalText), ",%s", decimalPoint + 1);
+      *decimalPoint = '\0';
+    }
+    strlcpy(integerText, valueText, sizeof(integerText));
+  }
+
+  const bool changed = setLabelTextIfChanged(integerLabel, integerText) |
+                       setLabelTextIfChanged(decimalLabel, decimalText) |
+                       setLabelTextIfChanged(unitLabel, unit);
+  if (!changed) return;
+  lv_obj_update_layout(integerLabel);
+  lv_obj_update_layout(decimalLabel);
+  lv_obj_update_layout(unitLabel);
+
+  constexpr int DECIMAL_GAP = 1;
+  constexpr int UNIT_GAP = 5;
+  const int decimalWidth =
+      decimalText[0] == '\0' ? 0 : lv_obj_get_width(decimalLabel);
+  const int totalWidth = lv_obj_get_width(integerLabel) + decimalWidth +
+                         (decimalWidth > 0 ? DECIMAL_GAP : 0) + UNIT_GAP +
+                         lv_obj_get_width(unitLabel);
+  int left = centerX - totalWidth / 2;
+  alignCenter(integerLabel, left + lv_obj_get_width(integerLabel) / 2,
+              centerY);
+  left += lv_obj_get_width(integerLabel);
+  if (decimalWidth > 0) {
+    left += DECIMAL_GAP;
+    alignCenter(decimalLabel, left + decimalWidth / 2, centerY + 4);
+    left += decimalWidth;
+  }
+  left += UNIT_GAP;
+  alignCenter(unitLabel, left + lv_obj_get_width(unitLabel) / 2, centerY + 4);
+}
+
+int analogMetricLineWidth(lv_obj_t *titleLabel, lv_obj_t *valueLabel,
+                          lv_obj_t *unitLabel) {
+  lv_obj_update_layout(titleLabel);
+  lv_obj_update_layout(valueLabel);
+  lv_obj_update_layout(unitLabel);
+  constexpr int TITLE_GAP = 12;
+  constexpr int UNIT_GAP = 7;
+  return lv_obj_get_width(titleLabel) + TITLE_GAP +
+         lv_obj_get_width(valueLabel) + UNIT_GAP + lv_obj_get_width(unitLabel);
+}
+
+void alignAnalogMetricLine(lv_obj_t *titleLabel, lv_obj_t *valueLabel,
+                           lv_obj_t *unitLabel, int centerY,
+                           int unitOffsetY = 6) {
+  constexpr int TITLE_GAP = 12;
+  constexpr int UNIT_GAP = 7;
+  const int totalWidth =
+      analogMetricLineWidth(titleLabel, valueLabel, unitLabel);
+  int left = -totalWidth / 2;
+  alignCenter(titleLabel, left + lv_obj_get_width(titleLabel) / 2, centerY + 5);
+  left += lv_obj_get_width(titleLabel) + TITLE_GAP;
+  alignCenter(valueLabel, left + lv_obj_get_width(valueLabel) / 2, centerY);
+  left += lv_obj_get_width(valueLabel) + UNIT_GAP;
+  alignCenter(unitLabel, left + lv_obj_get_width(unitLabel) / 2,
+              centerY + unitOffsetY);
+}
+
+void updateAnalogMetricDivider() {
+  if (analogMetricDivider == nullptr) return;
+  constexpr int MINIMUM_WIDTH = 138;
+  constexpr int HORIZONTAL_PADDING = 12;
+  constexpr int MAXIMUM_WIDTH = 250;
+  const int widestLine =
+      max(analogMetricLineWidth(analogMetricATitleLabel,
+                                analogMetricAValueLabel,
+                                analogMetricAUnitLabel),
+          analogMetricLineWidth(analogMetricBTitleLabel,
+                                analogMetricBValueLabel,
+                                analogMetricBUnitLabel));
+  const int dividerWidth =
+      constrain(widestLine + HORIZONTAL_PADDING, MINIMUM_WIDTH, MAXIMUM_WIDTH);
+  if (lv_obj_get_width(analogMetricDivider) != dividerWidth)
+    lv_obj_set_width(analogMetricDivider, dividerWidth);
+  alignCenter(analogMetricDivider, 0, 120);
+}
+
+void applyAnalogColors() {
+  if (!analogLayoutEnabled() || analogDialLayer == nullptr) return;
+  const bool redNight = redNightVisualEnabled();
+  const lv_color_t unifiedColor = analogTone();
+  const lv_color_t outside =
+      redNight ? COLOR_ERROR
+               : analogMonochromeValuesEnabled
+                     ? unifiedColor
+                     : metricColorForValue(currentValues.leftTemperatureC,
+                                           leftValueColorScale);
+  const lv_color_t room =
+      redNight ? COLOR_ERROR
+               : analogMonochromeValuesEnabled
+                     ? unifiedColor
+                     : metricColorForValue(currentValues.rightTemperatureC,
+                                           rightValueColorScale);
+  const lv_color_t metricA =
+      redNight ? COLOR_ERROR
+               : analogMonochromeValuesEnabled
+                     ? unifiedColor
+                     : metricColorForValue(currentValues.metricAValue,
+                                           metricAColorScale);
+  const lv_color_t metricB =
+      redNight ? COLOR_ERROR
+               : analogMonochromeValuesEnabled
+                     ? unifiedColor
+                     : metricColorForValue(currentValues.metricBValue,
+                                           metricBColorScale);
+  lv_obj_t *outsideLabels[] = {
+      analogOutsideTitleLabel, analogOutsideValueLabel,
+      analogOutsideDecimalLabel, analogOutsideUnitLabel};
+  lv_obj_t *roomLabels[] = {analogRoomTitleLabel, analogRoomValueLabel,
+                            analogRoomDecimalLabel, analogRoomUnitLabel};
+  lv_obj_t *metricALabels[] = {analogMetricATitleLabel,
+                               analogMetricAValueLabel,
+                               analogMetricAUnitLabel};
+  lv_obj_t *metricBLabels[] = {analogMetricBTitleLabel,
+                               analogMetricBValueLabel,
+                               analogMetricBUnitLabel};
+  for (lv_obj_t *label : outsideLabels) setTextColor(label, outside);
+  for (lv_obj_t *label : roomLabels) setTextColor(label, room);
+  for (lv_obj_t *label : metricALabels) setTextColor(label, metricA);
+  for (lv_obj_t *label : metricBLabels) setTextColor(label, metricB);
+  lv_obj_set_style_bg_color(
+      analogMetricDivider, redNight ? COLOR_ERROR : unifiedColor, 0);
+  setTextColor(dateLabel, redNight ? COLOR_ERROR
+                                  : analogMonochromeValuesEnabled
+                                        ? unifiedColor
+                                        : configuredColor(analogDateColor));
+  const lv_color_t weather =
+      redNight ? COLOR_ERROR
+               : analogMonochromeValuesEnabled
+                     ? unifiedColor
+                     : configuredColor(monochromeWeatherIconColor);
+  const bool animationIsMonochrome =
+      strncmp(weatherAnimationKey, "monochrome-", 11) == 0;
+  lv_obj_set_style_img_recolor(weatherImage, weather, 0);
+  lv_obj_set_style_img_recolor_opa(weatherImage, LV_OPA_COVER, 0);
+  lv_obj_set_style_img_recolor(weatherAnimation, weather, 0);
+  lv_obj_set_style_img_recolor_opa(
+      weatherAnimation,
+      redNight || analogMonochromeValuesEnabled || animationIsMonochrome
+          ? LV_OPA_COVER
+          : LV_OPA_TRANSP,
+      0);
+  setTextColor(roomIconLabel, room);
+}
+
 void alignConnectionStatusIcons() {
-  constexpr int STATUS_Y = 202;
+  const int STATUS_Y = analogLayoutEnabled() ? -177 : 202;
   constexpr int STATUS_SPACING = 28;
   const bool redNightVisual = redNightVisualEnabled();
   const bool showWifi = !redNightVisual || wifiConnected;
@@ -348,6 +1483,26 @@ void alignConnectionStatusIcons() {
   }
 }
 
+void applyConnectionStatusColors() {
+  if (redNightVisualEnabled()) {
+    setTextColor(wifiStatusLabel, COLOR_ERROR);
+    setTextColor(statusLabel, COLOR_ERROR);
+    setTextColor(webStatusLabel, COLOR_ERROR);
+  } else {
+    const lv_color_t connectedColor =
+        analogLayoutEnabled() ? analogTone() : COLOR_AIR;
+    const lv_color_t settingsColor =
+        analogLayoutEnabled() ? analogTone() : COLOR_OUTSIDE;
+    setTextColor(wifiStatusLabel,
+                 wifiConnected ? connectedColor : COLOR_ERROR);
+    setTextColor(statusLabel,
+                 currentValues.homeAssistantOnline ? connectedColor
+                                                   : COLOR_ERROR);
+    setTextColor(webStatusLabel, settingsColor);
+  }
+  alignConnectionStatusIcons();
+}
+
 void makeChildrenTapThrough(lv_obj_t *parent) {
   const uint32_t childCount = lv_obj_get_child_cnt(parent);
   for (uint32_t index = 0; index < childCount; ++index) {
@@ -357,7 +1512,7 @@ void makeChildrenTapThrough(lv_obj_t *parent) {
   }
 }
 
-void makeDivider(lv_obj_t *parent, int width, int height, int x, int y) {
+lv_obj_t *makeDivider(lv_obj_t *parent, int width, int height, int x, int y) {
   lv_obj_t *divider = lv_obj_create(parent);
   lv_obj_set_size(divider, width, height);
   lv_obj_set_style_radius(divider, 3, 0);
@@ -365,6 +1520,7 @@ void makeDivider(lv_obj_t *parent, int width, int height, int x, int y) {
   lv_obj_set_style_bg_color(divider, COLOR_DIVIDER, 0);
   alignCenter(divider, x, y);
   lv_obj_clear_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
+  return divider;
 }
 
 void setTopValue(float value, uint8_t decimals, int centerX,
@@ -374,14 +1530,14 @@ void setTopValue(float value, uint8_t decimals, int centerX,
   if (std::isnan(value)) {
     snprintf(valueText, sizeof(valueText), "--");
   } else {
-    snprintf(valueText, sizeof(valueText), decimals == 0 ? "%.0f" : "%.1f",
+    snprintf(valueText, sizeof(valueText), "%.*f", constrain(decimals, 0, 2),
              value);
   }
 
   char *decimalPoint = strchr(valueText, '.');
-  char decimalText[4] = "";
+  char decimalText[8] = "";
   if (decimalPoint != nullptr) {
-    snprintf(decimalText, sizeof(decimalText), ",%c", decimalPoint[1]);
+    snprintf(decimalText, sizeof(decimalText), ",%s", decimalPoint + 1);
     *decimalPoint = '\0';
   }
 
@@ -769,6 +1925,19 @@ void renderSecondLine(unsigned long now) {
 }
 
 void renderSecondRing(unsigned long now) {
+  if (analogLayoutEnabled()) {
+    for (lv_obj_t *dot : secondDots) {
+      if (dot != nullptr) lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_t *lineObjects[] = {secondLineBackgroundArc, secondLineFadeArc,
+                               secondLineActiveArc, secondLineActiveBridge,
+                               secondCometHead};
+    for (lv_obj_t *object : lineObjects) {
+      if (object != nullptr) lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+    }
+    secondFadeActive = false;
+    return;
+  }
   const unsigned long fadeDuration =
       secondEffect == CLOCK_SECOND_EFFECT_LINE ? SECOND_LINE_FADE_TOTAL_MS
                                                : SECOND_DOT_FADE_TOTAL_MS;
@@ -781,6 +1950,8 @@ void renderSecondRing(unsigned long now) {
 }
 
 void setTextColor(lv_obj_t *object, lv_color_t color) {
+  if (object == nullptr) return;
+  if (lv_obj_get_style_text_color(object, 0).full == color.full) return;
   lv_obj_set_style_text_color(object, color, 0);
 }
 
@@ -805,7 +1976,9 @@ void renderTimeColon(unsigned long now, bool force = false) {
                         elapsedWithinSecond;
     intensity = 0.5f - 0.5f * std::cos(phase * PI_VALUE);
   }
-  const uint32_t baseColor = redNightVisualEnabled() ? 0xFF0000 : timeColor;
+  // Inline barva dvojtečky musí na maximu přesně odpovídat barvě celého
+  // časového labelu v červeném nočním režimu (COLOR_ERROR).
+  const uint32_t baseColor = redNightVisualEnabled() ? 0xFF4848 : timeColor;
   const uint8_t red = static_cast<uint8_t>(
       std::round(((baseColor >> 16) & 0xFF) * intensity));
   const uint8_t green = static_cast<uint8_t>(
@@ -840,6 +2013,14 @@ void applyDashboardColors() {
         humidityValueLabel, humidityUnitLabel,
     };
     for (lv_obj_t *label : coloredLabels) setTextColor(label, COLOR_ERROR);
+    setTextColor(radarTitleLabel, COLOR_ERROR);
+    setTextColor(radarStatusLabel, COLOR_ERROR);
+    if (radarProgressBar != nullptr) {
+      lv_obj_set_style_bg_color(radarProgressBar,
+                                LV_COLOR_MAKE(58, 14, 14), LV_PART_MAIN);
+      lv_obj_set_style_bg_color(radarProgressBar, COLOR_ERROR,
+                                LV_PART_INDICATOR);
+    }
     lv_obj_set_style_img_recolor(weatherImage, COLOR_ERROR, 0);
     lv_obj_set_style_img_recolor_opa(weatherImage, LV_OPA_COVER, 0);
     lv_obj_set_style_img_recolor(roomWeatherImage, COLOR_ERROR, 0);
@@ -849,10 +2030,26 @@ void applyDashboardColors() {
     lv_obj_set_style_img_recolor(roomWeatherAnimation, COLOR_ERROR, 0);
     lv_obj_set_style_img_recolor_opa(roomWeatherAnimation, LV_OPA_COVER, 0);
   } else {
-    const lv_color_t configuredOutsideColor = configuredColor(outsideColor);
-    const lv_color_t configuredRoomColor = configuredColor(roomColor);
+    const lv_color_t configuredOutsideColor =
+        metricColorForValue(currentValues.leftTemperatureC,
+                            leftValueColorScale);
+    const lv_color_t configuredRoomColor =
+        metricColorForValue(currentValues.rightTemperatureC,
+                            rightValueColorScale);
     setTextColor(timeLabel, configuredColor(timeColor));
-    setTextColor(dateLabel, configuredColor(dateColor));
+    setTextColor(radarTitleLabel, COLOR_TEXT);
+    setTextColor(radarStatusLabel, COLOR_OUTSIDE);
+    if (radarProgressBar != nullptr) {
+      lv_obj_set_style_bg_color(radarProgressBar, COLOR_DIVIDER,
+                                LV_PART_MAIN);
+      lv_obj_set_style_bg_color(radarProgressBar,
+                                radarFullPreparationInProgress ? COLOR_ERROR
+                                                               : COLOR_OUTSIDE,
+                                LV_PART_INDICATOR);
+    }
+    setTextColor(dateLabel,
+                 configuredColor(analogLayoutEnabled() ? analogDateColor
+                                                       : dateColor));
     setTextColor(outsideTitleLabel, configuredOutsideColor);
     setTextColor(outsideIntegerLabel, configuredOutsideColor);
     setTextColor(outsideDecimalLabel, configuredOutsideColor);
@@ -873,36 +2070,25 @@ void applyDashboardColors() {
     setTextColor(humidityTitleLabel, configuredMetricBColor);
     setTextColor(humidityValueLabel, configuredMetricBColor);
     setTextColor(humidityUnitLabel, configuredMetricBColor);
-    lv_obj_set_style_img_recolor(weatherImage,
-                                 configuredColor(leftWeatherIconColor), 0);
+    const lv_color_t weatherColor =
+        configuredColor(monochromeWeatherIconColor);
+    lv_obj_set_style_img_recolor(weatherImage, weatherColor, 0);
     lv_obj_set_style_img_recolor_opa(weatherImage, LV_OPA_COVER, 0);
-    lv_obj_set_style_img_recolor(roomWeatherImage,
-                                 configuredColor(rightWeatherIconColor), 0);
+    lv_obj_set_style_img_recolor(roomWeatherImage, weatherColor, 0);
     lv_obj_set_style_img_recolor_opa(roomWeatherImage, LV_OPA_COVER, 0);
-    lv_obj_set_style_img_recolor(weatherAnimation,
-                                 configuredColor(leftWeatherIconColor), 0);
+    lv_obj_set_style_img_recolor(weatherAnimation, weatherColor, 0);
     lv_obj_set_style_img_recolor_opa(
         weatherAnimation,
         animationIsMonochrome ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-    lv_obj_set_style_img_recolor(roomWeatherAnimation,
-                                 configuredColor(rightWeatherIconColor), 0);
+    lv_obj_set_style_img_recolor(roomWeatherAnimation, weatherColor, 0);
     lv_obj_set_style_img_recolor_opa(
         roomWeatherAnimation,
         animationIsMonochrome ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
   }
-  if (redNightVisualEnabled()) {
-    setTextColor(wifiStatusLabel, COLOR_ERROR);
-    setTextColor(statusLabel, COLOR_ERROR);
-    setTextColor(webStatusLabel, COLOR_ERROR);
-  } else {
-    setTextColor(wifiStatusLabel, wifiConnected ? COLOR_AIR : COLOR_ERROR);
-    setTextColor(statusLabel,
-                 currentValues.homeAssistantOnline ? COLOR_AIR : COLOR_ERROR);
-    setTextColor(webStatusLabel, COLOR_OUTSIDE);
-  }
-  alignConnectionStatusIcons();
+  applyConnectionStatusColors();
   renderSecondRing(millis());
   renderTimeColon(millis(), true);
+  applyAnalogColors();
 }
 
 void toggleNightModeEvent(lv_event_t *event) {
@@ -943,6 +2129,8 @@ void showSettings() {
       lv_obj_clear_state(automaticUpdateSwitch, LV_STATE_CHECKED);
   }
   lv_dropdown_set_selected(webModeDropdown, selectedWebMode);
+  settingsSelectedClockStyle = activeClockStyle;
+  updateClockStyleCardSelection();
   showSettingsSubpage(0);
   settingsVisible = true;
   lv_obj_clear_flag(settingsPage, LV_OBJ_FLAG_HIDDEN);
@@ -951,6 +2139,69 @@ void showSettings() {
 
 void openSettingsEvent(lv_event_t *event) {
   if (lv_event_get_code(event) == LV_EVENT_LONG_PRESSED) showSettings();
+}
+
+void createRadarPage(lv_obj_t *screen) {
+  radarPage = lv_obj_create(screen);
+  lv_obj_set_size(radarPage, 480, 480);
+  lv_obj_center(radarPage);
+  lv_obj_set_style_bg_color(radarPage, COLOR_BACKGROUND, 0);
+  lv_obj_set_style_bg_opa(radarPage, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(radarPage, 0, 0);
+  lv_obj_set_style_pad_all(radarPage, 0, 0);
+  lv_obj_set_style_radius(radarPage, 0, 0);
+  lv_obj_clear_flag(radarPage, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(radarPage, LV_OBJ_FLAG_CLICKABLE);
+
+  radarCanvas = lv_canvas_create(radarPage);
+  lv_obj_center(radarCanvas);
+  lv_obj_add_flag(radarCanvas, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(radarCanvas, LV_OBJ_FLAG_CLICKABLE);
+
+  radarTitleLabel = makeLabel(radarPage, &clock_czech_16, COLOR_TEXT);
+  lv_label_set_recolor(radarTitleLabel, true);
+  lv_label_set_text(radarTitleLabel, "ČHMÚ - 50 km");
+  lv_obj_set_style_bg_color(radarTitleLabel, COLOR_BACKGROUND, 0);
+  lv_obj_set_style_bg_opa(radarTitleLabel, LV_OPA_80, 0);
+  lv_obj_set_style_pad_hor(radarTitleLabel, 8, 0);
+  lv_obj_set_style_pad_ver(radarTitleLabel, 4, 0);
+  alignCenter(radarTitleLabel, 0, -205);
+
+  radarProgressBar = lv_bar_create(radarPage);
+  lv_obj_set_size(radarProgressBar, 220, 3);
+  lv_obj_align(radarProgressBar, LV_ALIGN_CENTER, 0, -186);
+  lv_bar_set_range(radarProgressBar, 0, 1);
+  lv_bar_set_value(radarProgressBar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_radius(radarProgressBar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_radius(radarProgressBar, LV_RADIUS_CIRCLE,
+                          LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(radarProgressBar, COLOR_DIVIDER, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(radarProgressBar, LV_OPA_70, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(radarProgressBar, COLOR_OUTSIDE,
+                            LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(radarProgressBar, LV_OPA_70, LV_PART_INDICATOR);
+  lv_obj_clear_flag(radarProgressBar, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(radarProgressBar, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(radarProgressBar, LV_OBJ_FLAG_HIDDEN);
+
+  radarStatusLabel = makeLabel(radarPage, &clock_czech_16, COLOR_OUTSIDE);
+  lv_label_set_long_mode(radarStatusLabel, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(radarStatusLabel, 340);
+  lv_obj_set_style_text_align(radarStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(radarStatusLabel, englishLanguage()
+                                          ? "LOADING CHMI RADAR..."
+                                          : "Načítám radar ČHMÚ...");
+  lv_obj_set_style_bg_color(radarStatusLabel, COLOR_BACKGROUND, 0);
+  lv_obj_set_style_bg_opa(radarStatusLabel, LV_OPA_80, 0);
+  lv_obj_set_style_pad_all(radarStatusLabel, 6, 0);
+  alignCenter(radarStatusLabel, 0, 205);
+  lv_obj_add_flag(radarStatusLabel, LV_OBJ_FLAG_HIDDEN);
+
+  makeChildrenTapThrough(radarPage);
+  lv_obj_add_flag(radarPage, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(radarPage, openSettingsEvent, LV_EVENT_LONG_PRESSED,
+                      nullptr);
+  lv_obj_add_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
 }
 
 void closeSettings(bool saveChanges) {
@@ -970,7 +2221,8 @@ void closeSettings(bool saveChanges) {
         lv_obj_has_state(automaticUpdateSwitch, LV_STATE_CHECKED);
     selectedWebMode = lv_dropdown_get_selected(webModeDropdown);
     if (settingsSaveCallback != nullptr) {
-      settingsSaveCallback(savedDayBrightness, savedNightBrightness,
+      settingsSaveCallback(settingsSelectedClockStyle, savedDayBrightness,
+                           savedNightBrightness,
                            automaticDayNightEnabled, secondRingEnabled,
                            secondEffect, animatedWeatherIconsEnabled,
                            configuredWeatherIconStyle,
@@ -986,6 +2238,12 @@ void closeSettings(bool saveChanges) {
     brightnessPreviewCallback(nightModeEnabled ? savedNightBrightness
                                                : savedDayBrightness);
   }
+  // Dotykový řadič hlásí stejné uvolnění také jako globální SINGLE_CLICK.
+  // Zahodíme právě tento následující klik. Časový limit slouží jen jako
+  // pojistka, aby se nepotlačil pozdější skutečný dotyk, kdyby řadič klik
+  // po zavření překryvu výjimečně vůbec neposlal.
+  suppressNextDashboardClick = true;
+  suppressDashboardClickUntil = millis() + 3000;
   settingsVisible = false;
   lv_obj_add_flag(settingsPage, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1012,8 +2270,8 @@ void brightnessSliderEvent(lv_event_t *event) {
 
 void showSettingsSubpage(uint8_t page) {
   settingsPageIndex = constrain(page, static_cast<uint8_t>(0),
-                                static_cast<uint8_t>(2));
-  for (uint8_t index = 0; index < 3; ++index) {
+                                static_cast<uint8_t>(SETTINGS_PAGE_COUNT - 1));
+  for (uint8_t index = 0; index < SETTINGS_PAGE_COUNT; ++index) {
     setObjectVisible(settingsContent[index], index == settingsPageIndex);
   }
   if (settingsPageNumberLabel != nullptr) {
@@ -1028,7 +2286,7 @@ void showSettingsSubpage(uint8_t page) {
       lv_obj_clear_state(settingsPreviousButton, LV_STATE_DISABLED);
   }
   if (settingsNextButton != nullptr) {
-    if (settingsPageIndex == 2)
+    if (settingsPageIndex == SETTINGS_PAGE_COUNT - 1)
       lv_obj_add_state(settingsNextButton, LV_STATE_DISABLED);
     else
       lv_obj_clear_state(settingsNextButton, LV_STATE_DISABLED);
@@ -1043,13 +2301,134 @@ void settingsPreviousEvent(lv_event_t *event) {
 
 void settingsNextEvent(lv_event_t *event) {
   if (lv_event_get_code(event) == LV_EVENT_RELEASED &&
-      settingsPageIndex < 2)
+      settingsPageIndex < SETTINGS_PAGE_COUNT - 1)
     showSettingsSubpage(settingsPageIndex + 1);
 }
 
+void updateClockStyleCardSelection() {
+  if (digitalClockStyleCard == nullptr || analogClockStyleCard == nullptr)
+    return;
+  const bool digitalSelected =
+      settingsSelectedClockStyle == CLOCK_STYLE_DIGITAL;
+  lv_obj_set_style_border_width(digitalClockStyleCard,
+                                digitalSelected ? 4 : 1, 0);
+  lv_obj_set_style_border_color(
+      digitalClockStyleCard, digitalSelected ? COLOR_OUTSIDE : COLOR_DIVIDER,
+      0);
+  lv_obj_set_style_border_width(analogClockStyleCard,
+                                digitalSelected ? 1 : 4, 0);
+  lv_obj_set_style_border_color(
+      analogClockStyleCard, digitalSelected ? COLOR_DIVIDER : COLOR_OUTSIDE,
+      0);
+}
+
+void clockStyleCardEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_SHORT_CLICKED) return;
+  settingsSelectedClockStyle = static_cast<uint8_t>(
+      reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+  updateClockStyleCardSelection();
+}
+
+void drawClockStylePreviewEvent(lv_event_t *event) {
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) return;
+  lv_obj_t *preview = lv_event_get_target(event);
+  lv_draw_ctx_t *drawContext = lv_event_get_draw_ctx(event);
+  lv_area_t coordinates;
+  lv_obj_get_coords(preview, &coordinates);
+  const lv_point_t center = {
+      static_cast<lv_coord_t>((coordinates.x1 + coordinates.x2) / 2),
+      static_cast<lv_coord_t>((coordinates.y1 + coordinates.y2) / 2),
+  };
+  const uint8_t style = static_cast<uint8_t>(
+      reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+  const AnalogDrawTarget target = {drawContext, nullptr};
+
+  drawAnalogCircle(target, center, 62, LV_COLOR_MAKE(8, 13, 17));
+  drawAnalogArc(target, center, 60,
+                style == CLOCK_STYLE_ANALOG ? analogTone(0.65f)
+                                            : COLOR_DIVIDER,
+                2);
+
+  if (style == CLOCK_STYLE_ANALOG) {
+    for (uint8_t hour = 0; hour < 12; ++hour) {
+      const bool cardinal = hour % 3 == 0;
+      drawAnalogRadialLine(target, center, hour * 30.0f,
+                           cardinal ? 49.0f : 53.0f, 57.0f,
+                           cardinal ? COLOR_ROOM : analogTone(0.7f),
+                           cardinal ? 3 : 1);
+    }
+    drawAnalogLine(target, center, analogPoint(center, 305.0f, 31.0f),
+                   COLOR_TEXT, 6);
+    drawAnalogLine(target, center, analogPoint(center, 50.0f, 45.0f),
+                   COLOR_TEXT, 4);
+    drawAnalogLine(target, analogPoint(center, 180.0f, 13.0f),
+                   analogPoint(center, 180.0f, 51.0f), analogTone(), 2);
+    drawAnalogCircle(target, center, 5, analogTone());
+    drawAnalogCircle(target, center, 2, COLOR_TEXT);
+  } else {
+    const lv_point_t dividerFrom = {
+        static_cast<lv_coord_t>(center.x - 42),
+        static_cast<lv_coord_t>(center.y + 29),
+    };
+    const lv_point_t dividerTo = {
+        static_cast<lv_coord_t>(center.x + 42), dividerFrom.y,
+    };
+    drawAnalogLine(target, dividerFrom, dividerTo, COLOR_DIVIDER, 1);
+    drawAnalogArc(target, center, 54, COLOR_OUTSIDE, 2, LV_OPA_60);
+  }
+}
+
+lv_obj_t *makeClockStyleCard(lv_obj_t *parent, uint8_t style, int x,
+                             lv_obj_t **textLabel) {
+  lv_obj_t *card = lv_btn_create(parent);
+  lv_obj_set_size(card, 180, 236);
+  alignCenter(card, x, 10);
+  lv_obj_set_style_radius(card, 20, 0);
+  lv_obj_set_style_bg_color(card, LV_COLOR_MAKE(13, 18, 22), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_shadow_width(card, 0, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_add_event_cb(card, clockStyleCardEvent, LV_EVENT_SHORT_CLICKED,
+                      reinterpret_cast<void *>(static_cast<uintptr_t>(style)));
+
+  lv_obj_t *preview = lv_obj_create(card);
+  lv_obj_set_size(preview, 136, 136);
+  alignCenter(preview, 0, -30);
+  lv_obj_set_style_bg_opa(preview, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(preview, 0, 0);
+  lv_obj_set_style_pad_all(preview, 0, 0);
+  lv_obj_clear_flag(preview, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(preview, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(
+      preview, drawClockStylePreviewEvent, LV_EVENT_DRAW_MAIN,
+      reinterpret_cast<void *>(static_cast<uintptr_t>(style)));
+
+  if (style == CLOCK_STYLE_DIGITAL) {
+    lv_obj_t *time = makeLabel(preview, &lv_font_montserrat_28, COLOR_TEXT);
+    lv_label_set_text(time, "10:09");
+    alignCenter(time, 0, -20);
+    lv_obj_t *date = makeLabel(preview, &lv_font_montserrat_12, COLOR_MUTED);
+    lv_label_set_text(date, "SO 30. 8.");
+    alignCenter(date, 0, 7);
+    lv_obj_t *values =
+        makeLabel(preview, &lv_font_montserrat_12, COLOR_OUTSIDE);
+    lv_label_set_text(values, "22.4°   45%");
+    alignCenter(values, 0, 30);
+  }
+
+  lv_obj_t *label = makeLabel(card, &clock_czech_16, COLOR_TEXT);
+  if (textLabel != nullptr) *textLabel = label;
+  lv_label_set_text(label, style == CLOCK_STYLE_ANALOG ? "ANALOGOVÉ"
+                                                       : "DIGITÁLNÍ");
+  alignCenter(label, 0, 92);
+  lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+  return card;
+}
+
 lv_obj_t *makeSettingsSwitch(lv_obj_t *parent, const char *title, int y,
-                             bool checked) {
+                             bool checked, lv_obj_t **titleLabel = nullptr) {
   lv_obj_t *label = makeLabel(parent, &clock_czech_16, COLOR_TEXT);
+  if (titleLabel != nullptr) *titleLabel = label;
   lv_label_set_text(label, title);
   alignCenter(label, -55, y);
   lv_obj_t *control = lv_switch_create(parent);
@@ -1068,8 +2447,10 @@ lv_obj_t *makeSettingsDropdown(lv_obj_t *parent, const char *title,
                                int labelX = -92, int controlX = 95,
                                int controlWidth = 180,
                                int labelYOffset = 0,
-                               bool centerText = false) {
+                               bool centerText = false,
+                               lv_obj_t **titleLabel = nullptr) {
   lv_obj_t *label = makeLabel(parent, &clock_czech_16, COLOR_TEXT);
+  if (titleLabel != nullptr) *titleLabel = label;
   lv_label_set_text(label, title);
   alignCenter(label, labelX, y + labelYOffset);
   lv_obj_t *control = lv_dropdown_create(parent);
@@ -1168,16 +2549,26 @@ void createSettingsPage(lv_obj_t *screen) {
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
   }
 
-  lv_obj_t *dayBrightnessTitle =
-      makeLabel(settingsContent[0], &clock_czech_16, COLOR_ROOM);
-  lv_label_set_text(dayBrightnessTitle, "DENNÍ JAS");
-  alignCenter(dayBrightnessTitle, -55, -72);
+  clockStyleTitleLabel =
+      makeLabel(settingsContent[0], &clock_czech_16, COLOR_MUTED);
+  lv_label_set_text(clockStyleTitleLabel, "TYP HODIN");
+  alignCenter(clockStyleTitleLabel, 0, -132);
+  digitalClockStyleCard = makeClockStyleCard(
+      settingsContent[0], CLOCK_STYLE_DIGITAL, -98, &digitalClockStyleLabel);
+  analogClockStyleCard = makeClockStyleCard(
+      settingsContent[0], CLOCK_STYLE_ANALOG, 98, &analogClockStyleLabel);
+  updateClockStyleCardSelection();
+
+  dayBrightnessTitleLabel =
+      makeLabel(settingsContent[1], &clock_czech_16, COLOR_ROOM);
+  lv_label_set_text(dayBrightnessTitleLabel, "DENNÍ JAS");
+  alignCenter(dayBrightnessTitleLabel, -55, -72);
 
   dayBrightnessValueLabel =
-      makeLabel(settingsContent[0], &lv_font_montserrat_28, COLOR_TEXT);
+      makeLabel(settingsContent[1], &lv_font_montserrat_28, COLOR_TEXT);
   updateBrightnessLabel(dayBrightnessValueLabel, savedDayBrightness, 105, -72);
 
-  dayBrightnessSlider = lv_slider_create(settingsContent[0]);
+  dayBrightnessSlider = lv_slider_create(settingsContent[1]);
   lv_obj_set_size(dayBrightnessSlider, 330, 20);
   alignCenter(dayBrightnessSlider, 0, -40);
   lv_slider_set_range(dayBrightnessSlider, 1, 100);
@@ -1193,16 +2584,16 @@ void createSettingsPage(lv_obj_t *screen) {
   lv_obj_add_event_cb(dayBrightnessSlider, brightnessSliderEvent, LV_EVENT_ALL,
                       nullptr);
 
-  lv_obj_t *nightBrightnessTitle =
-      makeLabel(settingsContent[0], &clock_czech_16, COLOR_OUTSIDE);
-  lv_label_set_text(nightBrightnessTitle, "NOČNÍ JAS");
-  alignCenter(nightBrightnessTitle, -55, 8);
+  nightBrightnessTitleLabel =
+      makeLabel(settingsContent[1], &clock_czech_16, COLOR_OUTSIDE);
+  lv_label_set_text(nightBrightnessTitleLabel, "NOČNÍ JAS");
+  alignCenter(nightBrightnessTitleLabel, -55, 8);
 
   nightBrightnessValueLabel =
-      makeLabel(settingsContent[0], &lv_font_montserrat_28, COLOR_TEXT);
+      makeLabel(settingsContent[1], &lv_font_montserrat_28, COLOR_TEXT);
   updateBrightnessLabel(nightBrightnessValueLabel, savedNightBrightness, 105, 8);
 
-  nightBrightnessSlider = lv_slider_create(settingsContent[0]);
+  nightBrightnessSlider = lv_slider_create(settingsContent[1]);
   lv_obj_set_size(nightBrightnessSlider, 330, 20);
   alignCenter(nightBrightnessSlider, 0, 40);
   lv_slider_set_range(nightBrightnessSlider, 1, 100);
@@ -1219,35 +2610,38 @@ void createSettingsPage(lv_obj_t *screen) {
                       nullptr);
 
   automaticDayNightSwitch = makeSettingsSwitch(
-      settingsContent[0], "AUTOMATICKY DEN/NOC", 92, automaticDayNightEnabled);
+      settingsContent[1], "AUTOMATICKY DEN/NOC", 92, automaticDayNightEnabled,
+      &automaticDayNightTitleLabel);
 
   weatherIconModeDropdown = makeSettingsDropdown(
-      settingsContent[1], "IKONY POČASÍ",
+      settingsContent[2], "IKONY POČASÍ",
       "STATICKÉ MONOCHROMATICKÉ\nANIMOVANÉ FLAT\nANIMOVANÉ LINE\nANIMOVANÉ MONOCHROMATICKÉ",
-      -54, selectedWeatherIconMode(), 0, 0, 360, -40, true);
+      -54, selectedWeatherIconMode(), 0, 0, 360, -40, true,
+      &weatherIconModeTitleLabel);
   secondModeDropdown = makeSettingsDropdown(
-      settingsContent[1], "VTEŘINY", "VYPNUTO\nTEČKY\nLINKA\nKOMETA", 50,
-      selectedSecondMode(), 0, 0, 360, -40, true);
+      settingsContent[2], "VTEŘINY", "VYPNUTO\nTEČKY\nLINKA\nKOMETA", 50,
+      selectedSecondMode(), 0, 0, 360, -40, true, &secondModeTitleLabel);
 
-  wifiAddressLabel = makeLabel(settingsContent[2], &lv_font_montserrat_16, COLOR_MUTED);
+  wifiAddressLabel = makeLabel(settingsContent[3], &lv_font_montserrat_16, COLOR_MUTED);
   lv_label_set_text(wifiAddressLabel, "IP: —");
   alignCenter(wifiAddressLabel, 0, -112);
-  firmwareVersionLabel = makeLabel(settingsContent[2], &lv_font_montserrat_16, COLOR_MUTED);
+  firmwareVersionLabel = makeLabel(settingsContent[3], &lv_font_montserrat_16, COLOR_MUTED);
   lv_label_set_text(firmwareVersionLabel, "FIRMWARE: —");
   alignCenter(firmwareVersionLabel, 0, -88);
-  deviceInfoLabel = makeLabel(settingsContent[2], &clock_czech_16, COLOR_MUTED);
+  deviceInfoLabel = makeLabel(settingsContent[3], &clock_czech_16, COLOR_MUTED);
   lv_label_set_text(deviceInfoLabel, "");
   alignCenter(deviceInfoLabel, 0, -64);
   webModeDropdown = makeSettingsDropdown(
-      settingsContent[2], "WEB", "10 MINUT\nVŽDY\nVYPNUTÝ", -24, selectedWebMode);
+      settingsContent[3], "WEB", "10 MINUT\nVŽDY\nVYPNUTÝ", -24,
+      selectedWebMode, -92, 95, 180, 0, false, &webModeTitleLabel);
   const bool firmwareControlsAvailable =
       firmwareCheckCallback != nullptr && firmwareInstallCallback != nullptr;
   if (firmwareControlsAvailable) {
     automaticUpdateSwitch = makeSettingsSwitch(
-        settingsContent[2], "AUTOMATICKÉ OTA", 30,
-        automaticFirmwareUpdateEnabled);
+        settingsContent[3], "AUTOMATICKÉ OTA", 30,
+        automaticFirmwareUpdateEnabled, &automaticUpdateTitleLabel);
 
-    firmwareCheckButton = lv_btn_create(settingsContent[2]);
+    firmwareCheckButton = lv_btn_create(settingsContent[3]);
     lv_obj_set_size(firmwareCheckButton, 190, 42);
     alignCenter(firmwareCheckButton, 0, 88);
     lv_obj_set_style_radius(firmwareCheckButton, 21, 0);
@@ -1259,7 +2653,7 @@ void createSettingsPage(lv_obj_t *screen) {
     lv_label_set_text(checkLabel, "ZKONTROLOVAT");
     lv_obj_center(checkLabel);
 
-    firmwareInstallButton = lv_btn_create(settingsContent[2]);
+    firmwareInstallButton = lv_btn_create(settingsContent[3]);
     lv_obj_set_size(firmwareInstallButton, 190, 42);
     alignCenter(firmwareInstallButton, 0, 88);
     lv_obj_set_style_radius(firmwareInstallButton, 21, 0);
@@ -1277,7 +2671,7 @@ void createSettingsPage(lv_obj_t *screen) {
     firmwareInstallButton = nullptr;
     automaticFirmwareUpdateEnabled = false;
   }
-  firmwareStatusLabel = makeLabel(settingsContent[2], &clock_czech_16, COLOR_MUTED);
+  firmwareStatusLabel = makeLabel(settingsContent[3], &clock_czech_16, COLOR_MUTED);
   lv_obj_set_width(firmwareStatusLabel, 360);
   lv_obj_set_style_text_align(firmwareStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(firmwareStatusLabel, "");
@@ -1309,13 +2703,23 @@ void createSettingsPage(lv_obj_t *screen) {
 }
 }  // namespace
 
+uint8_t clockDashboardWeatherIconStyle(uint8_t configuredStyle) {
+  const bool monochromeAnalogValues =
+      analogLayoutEnabled() && analogMonochromeValuesEnabled;
+  return redNightVisualEnabled() || monochromeAnalogValues
+             ? CLOCK_WEATHER_ICON_STYLE_MONOCHROME
+             : configuredStyle;
+}
+
 void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
                         uint8_t nightBrightness, bool automaticDayNight,
                         BrightnessPreviewCallback brightnessPreview,
                         SettingsOpenCallback settingsOpen,
                         SettingsSaveCallback settingsSave,
                         SettingsActionCallback firmwareCheck,
-                        SettingsActionCallback firmwareInstall) {
+                        SettingsActionCallback firmwareInstall,
+                        RadarVisibilityCallback radarVisibility,
+                        RadarRangeCallback radarRange) {
   savedDayBrightness = constrain(dayBrightness, 1, 100);
   savedNightBrightness = constrain(nightBrightness, 1, 100);
   automaticDayNightEnabled = automaticDayNight;
@@ -1324,6 +2728,12 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   settingsSaveCallback = settingsSave;
   firmwareCheckCallback = firmwareCheck;
   firmwareInstallCallback = firmwareInstall;
+  radarVisibilityCallback = radarVisibility;
+  radarRangeCallback = radarRange;
+  // The combined host has its own radar screen and passes null callbacks.
+  // Treat the callback pair as the capability boundary so the standalone
+  // clock-local radar cannot be selected or fed accidentally.
+  radarFeatureAvailable = radarVisibility != nullptr && radarRange != nullptr;
   lv_obj_t *screen = lv_scr_act();
   lv_obj_set_style_bg_color(screen, COLOR_BACKGROUND, 0);
   lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
@@ -1333,7 +2743,7 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
 
   dashboardContent = lv_obj_create(screen);
   lv_obj_set_size(dashboardContent, 480, 480);
-  lv_obj_set_pos(dashboardContent, 0, -10);
+  lv_obj_set_pos(dashboardContent, 0, analogLayoutEnabled() ? 0 : -10);
   lv_obj_set_style_bg_opa(dashboardContent, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(dashboardContent, 0, 0);
   lv_obj_set_style_pad_all(dashboardContent, 0, 0);
@@ -1352,24 +2762,24 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   lv_label_set_text(dateLabel, "");
   alignCenter(dateLabel, 0, -43);
 
-  outsideTitleLabel = makeLabel(content, &clock_czech_18, COLOR_OUTSIDE);
+  outsideTitleLabel = makeLabel(content, &clock_czech_20, COLOR_OUTSIDE);
   lv_obj_set_style_text_letter_space(outsideTitleLabel, 2, 0);
   lv_label_set_text(outsideTitleLabel, "VENKU");
   alignCenter(outsideTitleLabel, -122, 5);
 
-  roomTitleLabel = makeLabel(content, &clock_czech_18, COLOR_ROOM);
+  roomTitleLabel = makeLabel(content, &clock_czech_20, COLOR_ROOM);
   lv_obj_set_style_text_letter_space(roomTitleLabel, 2, 0);
   lv_label_set_text(roomTitleLabel, "MÍSTNOST");
   alignCenter(roomTitleLabel, 127, 5);
 
   outsideIntegerLabel = makeLabel(content, &lv_font_montserrat_48, COLOR_OUTSIDE);
   outsideDecimalLabel = makeLabel(content, &lv_font_montserrat_32, COLOR_OUTSIDE);
-  outsideUnitLabel = makeLabel(content, &lv_font_montserrat_24, COLOR_OUTSIDE);
+  outsideUnitLabel = makeLabel(content, &clock_unit_24, COLOR_OUTSIDE);
   lv_label_set_text(outsideUnitLabel, "°C");
 
   roomIntegerLabel = makeLabel(content, &lv_font_montserrat_48, COLOR_ROOM);
   roomDecimalLabel = makeLabel(content, &lv_font_montserrat_32, COLOR_ROOM);
-  roomUnitLabel = makeLabel(content, &lv_font_montserrat_24, COLOR_ROOM);
+  roomUnitLabel = makeLabel(content, &clock_unit_24, COLOR_ROOM);
   lv_label_set_text(roomUnitLabel, "°C");
 
   weatherImage = lv_img_create(content);
@@ -1396,23 +2806,23 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   lv_label_set_text(roomIconLabel, "\xEF\x80\x95");  // home (U+F015)
   alignCenter(roomIconLabel, 142, 107);
 
-  // Středový oblouk: dvě svislé nohy, horní půlkruh a krátký dřík.
-  lv_obj_t *airArc = lv_arc_create(content);
-  lv_obj_set_size(airArc, 196, 196);
-  lv_arc_set_bg_angles(airArc, 180, 360);
-  lv_arc_set_range(airArc, 0, 100);
-  lv_arc_set_value(airArc, 0);
-  lv_obj_remove_style(airArc, nullptr, LV_PART_KNOB);
-  lv_obj_remove_style(airArc, nullptr, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_width(airArc, 3, LV_PART_MAIN);
-  lv_obj_set_style_arc_color(airArc, COLOR_DIVIDER, LV_PART_MAIN);
-  lv_obj_set_style_arc_rounded(airArc, false, LV_PART_MAIN);
-  alignCenter(airArc, 0, 142);
-  lv_obj_clear_flag(airArc, LV_OBJ_FLAG_CLICKABLE);
+  // Digitální středový oblouk: dvě svislé nohy, horní půlkruh a krátký dřík.
+  digitalAirArc = lv_arc_create(content);
+  lv_obj_set_size(digitalAirArc, 196, 196);
+  lv_arc_set_bg_angles(digitalAirArc, 180, 360);
+  lv_arc_set_range(digitalAirArc, 0, 100);
+  lv_arc_set_value(digitalAirArc, 0);
+  lv_obj_remove_style(digitalAirArc, nullptr, LV_PART_KNOB);
+  lv_obj_remove_style(digitalAirArc, nullptr, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(digitalAirArc, 3, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(digitalAirArc, COLOR_DIVIDER, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(digitalAirArc, false, LV_PART_MAIN);
+  alignCenter(digitalAirArc, 0, 142);
+  lv_obj_clear_flag(digitalAirArc, LV_OBJ_FLAG_CLICKABLE);
 
-  makeDivider(content, 3, 34, 0, 28);
-  makeDivider(content, 3, 34, -98, 158);
-  makeDivider(content, 3, 34, 98, 158);
+  digitalAirStem = makeDivider(content, 3, 34, 0, 28);
+  digitalAirLeftLeg = makeDivider(content, 3, 34, -97, 158);
+  digitalAirRightLeg = makeDivider(content, 3, 34, 96, 158);
 
   co2TitleLabel = makeLabel(content, &clock_czech_16, COLOR_AIR);
   lv_label_set_text(co2TitleLabel, "CO₂");
@@ -1423,7 +2833,7 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   co2UnitLabel = makeLabel(content, &clock_czech_16, COLOR_AIR);
   lv_label_set_text(co2UnitLabel, "ppm");
 
-  makeDivider(content, 152, 2, 0, 121);
+  digitalMetricDivider = makeDivider(content, 152, 2, 0, 121);
 
   humidityTitleLabel =
       makeLabel(content, &clock_czech_16, COLOR_HUMIDITY);
@@ -1438,7 +2848,7 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   lv_label_set_text(humidityUnitLabel, "%");
   alignCenter(humidityUnitLabel, 73, 154);
 
-  makeDivider(content, 286, 2, 0, 174);
+  digitalBottomDivider = makeDivider(content, 286, 2, 0, 174);
 
   wifiStatusLabel = makeLabel(content, &lv_font_montserrat_16, COLOR_ERROR);
   lv_label_set_text(wifiStatusLabel, LV_SYMBOL_WIFI);
@@ -1451,12 +2861,13 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
   lv_obj_add_flag(webStatusLabel, LV_OBJ_FLAG_HIDDEN);
   alignConnectionStatusIcons();
 
+  createAnalogLayout(content);
+
   clockDashboardUpdate(values);
   makeChildrenTapThrough(dashboardContent);
   lv_obj_add_event_cb(dashboardContent, openSettingsEvent, LV_EVENT_LONG_PRESSED,
                       nullptr);
-  lv_obj_add_event_cb(dashboardContent, toggleNightModeEvent,
-                      LV_EVENT_SHORT_CLICKED, nullptr);
+  createRadarPage(screen);
   createSettingsPage(screen);
 
   firmwareUpdateOverlay = lv_obj_create(screen);
@@ -1478,15 +2889,44 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
       makeLabel(firmwareUpdateOverlay, &lv_font_montserrat_48, COLOR_TEXT);
   lv_label_set_text(firmwareUpdateCountdownLabel, "5");
   alignCenter(firmwareUpdateCountdownLabel, 0, 35);
+  // Změna vzhledu musí znovu naplnit oba framebuffery celým shodným
+  // ciferníkem. Teprve potom se vrátíme k částečnému direct-mode renderu.
+  displayDriverSetPartialRefresh(analogLayoutEnabled(),
+                                 analogLayoutEnabled());
 }
 
 void clockDashboardApplyConfiguration(const ClockConfig &config) {
+  dashboardRuntimeConfig = config;
+  dashboardRuntimeConfigAvailable = true;
+  radarFeatureAvailable = radarVisibilityCallback != nullptr &&
+                          radarRangeCallback != nullptr &&
+                          clockConfigRadarAvailable(config);
+  if (!radarFeatureAvailable && radarVisible) {
+    radarVisible = false;
+    lv_obj_add_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
+    if (!settingsVisible && !firmwareUpdateActive) {
+      lv_obj_clear_flag(dashboardContent, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(dashboardContent);
+    }
+    if (radarVisibilityCallback != nullptr) radarVisibilityCallback(false);
+  }
+  language = constrain(config.language,
+                       static_cast<uint8_t>(CLOCK_LANGUAGE_UNSET),
+                       static_cast<uint8_t>(CLOCK_LANGUAGE_ENGLISH));
+  applyDashboardLanguage();
+  const bool wasRedNight = redNightVisualEnabled();
   const bool nightVisualChanged = nightVisualMode != config.nightVisualMode;
   nightVisualMode = config.nightVisualMode;
   metricAConfig = config.metricA;
   metricBConfig = config.metricB;
+  leftValueConfig = config.leftValue;
+  rightValueConfig = config.rightValue;
+  normalizeMicroSign(leftValueConfig.suffix);
+  normalizeMicroSign(rightValueConfig.suffix);
   normalizeMicroSign(metricAConfig.suffix);
   normalizeMicroSign(metricBConfig.suffix);
+  leftValueColorScale = config.leftValueColorScale;
+  rightValueColorScale = config.rightValueColorScale;
   metricAColorScale = config.metricAColorScale;
   metricBColorScale = config.metricBColorScale;
   const bool openMeteo = config.dataSource == CLOCK_DATA_SOURCE_OPEN_METEO;
@@ -1511,41 +2951,42 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
       return "mm";
     return "";
   };
-  const auto openMeteoDecimals = [](const char *value) -> uint8_t {
-    return strcmp(value, "relative_humidity_2m") == 0 ||
-                   strcmp(value, "cloud_cover") == 0 ||
-                   strcmp(value, "pressure_msl") == 0 ||
-                   strcmp(value, "surface_pressure") == 0 ||
-                   strcmp(value, "wind_direction_10m") == 0
-               ? 0
-               : 1;
+  const auto slotUnit = [&](size_t index) -> const char * {
+    return config.tmepSlots[index].enabled
+               ? config.tmepSlots[index].unit
+               : openMeteoUnit(config.openMeteoSlots[index].value);
+  };
+  const auto slotDecimals = [&](size_t index) -> uint8_t {
+    return config.tmepSlots[index].decimals;
   };
   if (openMeteo) {
     clockConfigCopy(metricAConfig.name, sizeof(metricAConfig.name),
                     config.openMeteoSlots[2].name);
     clockConfigCopy(metricAConfig.suffix, sizeof(metricAConfig.suffix),
-                    openMeteoUnit(config.openMeteoSlots[2].value));
-    metricAConfig.decimals = openMeteoDecimals(config.openMeteoSlots[2].value);
+                    slotUnit(2));
+    metricAConfig.decimals = slotDecimals(2);
     clockConfigCopy(metricBConfig.name, sizeof(metricBConfig.name),
                     config.openMeteoSlots[3].name);
     clockConfigCopy(metricBConfig.suffix, sizeof(metricBConfig.suffix),
-                    openMeteoUnit(config.openMeteoSlots[3].value));
-    metricBConfig.decimals = openMeteoDecimals(config.openMeteoSlots[3].value);
+                    slotUnit(3));
+    metricBConfig.decimals = slotDecimals(3);
     metricAColorScale = ClockMetricColorScale{};
     metricAColorScale.points[0].color = config.openMeteoSlots[2].color;
     metricBColorScale = ClockMetricColorScale{};
     metricBColorScale.points[0].color = config.openMeteoSlots[3].color;
-    strlcpy(outsideUnit, openMeteoUnit(config.openMeteoSlots[0].value),
-            sizeof(outsideUnit));
-    strlcpy(roomUnit, openMeteoUnit(config.openMeteoSlots[1].value),
-            sizeof(roomUnit));
-    outsideDecimals = openMeteoDecimals(config.openMeteoSlots[0].value);
-    roomDecimals = openMeteoDecimals(config.openMeteoSlots[1].value);
+    leftValueColorScale = ClockMetricColorScale{};
+    leftValueColorScale.points[0].color = config.openMeteoSlots[0].color;
+    rightValueColorScale = ClockMetricColorScale{};
+    rightValueColorScale.points[0].color = config.openMeteoSlots[1].color;
+    strlcpy(outsideUnit, slotUnit(0), sizeof(outsideUnit));
+    strlcpy(roomUnit, slotUnit(1), sizeof(roomUnit));
+    outsideDecimals = slotDecimals(0);
+    roomDecimals = slotDecimals(1);
   } else {
-    strlcpy(outsideUnit, "°C", sizeof(outsideUnit));
-    strlcpy(roomUnit, "°C", sizeof(roomUnit));
-    outsideDecimals = 1;
-    roomDecimals = 1;
+    strlcpy(outsideUnit, leftValueConfig.suffix, sizeof(outsideUnit));
+    strlcpy(roomUnit, rightValueConfig.suffix, sizeof(roomUnit));
+    outsideDecimals = leftValueConfig.decimals;
+    roomDecimals = rightValueConfig.decimals;
   }
   automaticDayNightEnabled = config.automaticDayNight;
   const bool timeColonModeChanged =
@@ -1564,10 +3005,6 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
   secondDotSize = constrain(config.secondDotSize, 1, 10);
   secondDotColor = config.secondDotColor & 0xFFFFFF;
   secondDotBrightness = config.secondDotBrightness;
-  outsideColor = (openMeteo ? config.openMeteoSlots[0].color
-                            : config.leftSide.color) & 0xFFFFFF;
-  roomColor = (openMeteo ? config.openMeteoSlots[1].color
-                         : config.rightSide.color) & 0xFFFFFF;
   timeColor = config.timeColor & 0xFFFFFF;
   dateColor = config.dateColor & 0xFFFFFF;
   timeFont = constrain(config.timeFont,
@@ -1604,11 +3041,18 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
                                                : savedDayBrightness);
   }
   renderSecondRing(millis());
-  if (nightVisualChanged) applyDashboardColors();
+  if (nightVisualChanged) {
+    if (analogLayoutEnabled() && wasRedNight != redNightVisualEnabled()) {
+      rebuildAnalogDialCache();
+      if (analogDialLayer != nullptr) lv_obj_invalidate(analogDialLayer);
+      invalidateAnalogHands();
+    }
+    applyDashboardColors();
+  }
   lv_label_set_text(outsideTitleLabel, openMeteo
                                            ? config.openMeteoSlots[0].name
                                            : config.leftSide.name[0] == '\0'
-                                           ? "MÍSTNOST"
+                                           ? (englishLanguage() ? "ROOM" : "MÍSTNOST")
                                            : config.leftSide.name);
   alignCenter(outsideTitleLabel, -122, 5);
   setObjectVisible(outsideTitleLabel, outsideConfigured);
@@ -1618,7 +3062,7 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
   lv_label_set_text(roomTitleLabel, openMeteo
                                         ? config.openMeteoSlots[1].name
                                         : config.rightSide.name[0] == '\0'
-                                        ? "MÍSTNOST"
+                                        ? (englishLanguage() ? "ROOM" : "MÍSTNOST")
                                         : config.rightSide.name);
   alignCenter(roomTitleLabel, 127, 5);
   setObjectVisible(roomTitleLabel, roomConfigured);
@@ -1653,7 +3097,154 @@ void clockDashboardApplyConfiguration(const ClockConfig &config) {
   setObjectVisible(humidityTitleLabel, metricBConfigured);
   setObjectVisible(humidityValueLabel, metricBConfigured);
   setObjectVisible(humidityUnitLabel, metricBConfigured);
+  if (analogLayoutEnabled()) {
+    lv_obj_clear_flag(analogDialLayer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(analogHandsLayer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(analogMetricDivider, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(analogOutsideTitleLabel,
+                      lv_label_get_text(outsideTitleLabel));
+    lv_label_set_text(analogRoomTitleLabel, lv_label_get_text(roomTitleLabel));
+    lv_label_set_text(analogMetricATitleLabel, metricAConfig.name);
+    lv_label_set_text(analogMetricBTitleLabel, metricBConfig.name);
+    alignCenter(analogOutsideTitleLabel, -112, -8);
+    alignCenter(analogRoomTitleLabel, 112, -8);
+    lv_obj_update_layout(analogMetricATitleLabel);
+    lv_obj_update_layout(analogMetricBTitleLabel);
+    lv_obj_update_layout(analogMetricAValueLabel);
+    lv_obj_update_layout(analogMetricBValueLabel);
+    lv_obj_update_layout(analogMetricAUnitLabel);
+    lv_obj_update_layout(analogMetricBUnitLabel);
+    alignAnalogMetricLine(analogMetricATitleLabel, analogMetricAValueLabel,
+                          analogMetricAUnitLabel, 98);
+    alignAnalogMetricLine(analogMetricBTitleLabel, analogMetricBValueLabel,
+                          analogMetricBUnitLabel, 140, 4);
+    updateAnalogMetricDivider();
+
+    setObjectVisible(analogOutsideTitleLabel, outsideConfigured);
+    setObjectVisible(analogOutsideValueLabel, outsideConfigured);
+    setObjectVisible(analogOutsideDecimalLabel, outsideConfigured);
+    setObjectVisible(analogOutsideUnitLabel, outsideConfigured);
+    setObjectVisible(analogRoomTitleLabel, roomConfigured);
+    setObjectVisible(analogRoomValueLabel, roomConfigured);
+    setObjectVisible(analogRoomDecimalLabel, roomConfigured);
+    setObjectVisible(analogRoomUnitLabel, roomConfigured);
+    setObjectVisible(analogMetricATitleLabel, metricAConfigured);
+    setObjectVisible(analogMetricAValueLabel, metricAConfigured);
+    setObjectVisible(analogMetricAUnitLabel, metricAConfigured);
+    setObjectVisible(analogMetricBTitleLabel, metricBConfigured);
+    setObjectVisible(analogMetricBValueLabel, metricBConfigured);
+    setObjectVisible(analogMetricBUnitLabel, metricBConfigured);
+
+    lv_obj_t *digitalOnly[] = {
+        timeLabel,          outsideTitleLabel,   outsideIntegerLabel,
+        outsideDecimalLabel, outsideUnitLabel,   roomTitleLabel,
+        roomIntegerLabel,   roomDecimalLabel,    roomUnitLabel,
+        outsideIconLabel,   co2TitleLabel,       co2ValueLabel,
+        co2UnitLabel,       humidityTitleLabel,  humidityValueLabel,
+        humidityUnitLabel,  roomWeatherImage,    weatherAnimation,
+        roomWeatherAnimation, roomIconLabel, digitalAirArc,
+        digitalAirStem, digitalAirLeftLeg, digitalAirRightLeg,
+        digitalMetricDivider, digitalBottomDivider,
+    };
+    for (lv_obj_t *object : digitalOnly)
+      lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_font(dateLabel, &clock_czech_20, 0);
+    alignCenter(dateLabel, 0, -132);
+    alignCenter(weatherImage, 0, -70);
+    alignCenter(weatherAnimation, 0, -70);
+  } else {
+    lv_obj_t *analogOnly[] = {
+        analogDialLayer,          analogHandsLayer,
+        analogOutsideTitleLabel, analogOutsideValueLabel,
+        analogOutsideDecimalLabel, analogOutsideUnitLabel,
+        analogRoomTitleLabel,    analogRoomValueLabel,
+        analogRoomDecimalLabel,  analogRoomUnitLabel,
+        analogMetricATitleLabel, analogMetricAValueLabel,
+        analogMetricAUnitLabel,  analogMetricBTitleLabel,
+        analogMetricBValueLabel, analogMetricBUnitLabel,
+        analogMetricDivider,
+    };
+    for (lv_obj_t *object : analogOnly)
+      lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(timeLabel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalAirArc, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalAirStem, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalAirLeftLeg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalAirRightLeg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalMetricDivider, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(digitalBottomDivider, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_font(dateLabel, &clock_czech_18, 0);
+    lv_obj_set_style_text_letter_space(dateLabel, 4, 0);
+    alignCenter(dateLabel, 0, -43);
+    alignCenter(weatherImage, -142, 107);
+    alignCenter(weatherAnimation, -142, 107);
+    alignCenter(roomWeatherImage, 142, 107);
+    alignCenter(roomWeatherAnimation, 142, 107);
+  }
+  lv_obj_set_pos(dashboardContent, 0, analogLayoutEnabled() ? 0 : -10);
+  alignConnectionStatusIcons();
+  renderSecondRing(millis());
   clockDashboardUpdate(currentValues);
+}
+
+void clockDashboardApplyAppearance(const ClockAppearanceConfig &appearance) {
+  const uint8_t style = constrain(
+      appearance.style, static_cast<uint8_t>(CLOCK_STYLE_DIGITAL),
+      static_cast<uint8_t>(CLOCK_STYLE_ANALOG));
+  const uint32_t tone = appearance.analogToneColor & 0xFFFFFF;
+  const uint32_t handTone = appearance.analogHandToneColor & 0xFFFFFF;
+  const uint32_t accentColor =
+      appearance.analogCardinalAccentColor & 0xFFFFFF;
+  const bool accentsEnabled = appearance.analogCardinalAccentsEnabled;
+  const bool outlineHandsEnabled = appearance.analogOutlineHandsEnabled;
+  const bool monochromeValuesEnabled =
+      appearance.analogMonochromeValuesEnabled;
+  const bool valuesAboveHandsEnabled =
+      appearance.analogValuesAboveHandsEnabled;
+  const uint32_t appearanceDateColor =
+      appearance.analogDateColor & 0xFFFFFF;
+  const uint32_t weatherColor =
+      appearance.monochromeWeatherIconColor & 0xFFFFFF;
+  if (activeClockStyle == style && analogToneColor == tone &&
+      analogHandToneColor == handTone &&
+      analogCardinalAccentColor == accentColor &&
+      analogCardinalAccentsEnabled == accentsEnabled &&
+      analogOutlineHandsEnabled == outlineHandsEnabled &&
+      analogMonochromeValuesEnabled == monochromeValuesEnabled &&
+      analogValuesAboveHandsEnabled == valuesAboveHandsEnabled &&
+      analogDateColor == appearanceDateColor &&
+      monochromeWeatherIconColor == weatherColor &&
+      dashboardContent != nullptr) {
+    return;
+  }
+  const bool styleChanged = activeClockStyle != style;
+  const bool valueLayerChanged =
+      analogValuesAboveHandsEnabled != valuesAboveHandsEnabled;
+  const bool dialAppearanceChanged = analogToneColor != tone ||
+                                     analogCardinalAccentColor != accentColor ||
+                                     analogCardinalAccentsEnabled !=
+                                         accentsEnabled;
+  activeClockStyle = style;
+  analogToneColor = tone;
+  analogHandToneColor = handTone;
+  analogCardinalAccentColor = accentColor;
+  analogCardinalAccentsEnabled = accentsEnabled;
+  analogOutlineHandsEnabled = outlineHandsEnabled;
+  analogMonochromeValuesEnabled = monochromeValuesEnabled;
+  analogValuesAboveHandsEnabled = valuesAboveHandsEnabled;
+  analogDateColor = appearanceDateColor;
+  monochromeWeatherIconColor = weatherColor;
+  if (dashboardContent == nullptr || !dashboardRuntimeConfigAvailable) return;
+  clockDashboardApplyConfiguration(dashboardRuntimeConfig);
+  updateAnalogValueLayerOrder();
+  if (analogLayoutEnabled() && (styleChanged || dialAppearanceChanged))
+    rebuildAnalogDialCache();
+  applyDashboardColors();
+  displayDriverSetPartialRefresh(
+      analogLayoutEnabled(), analogLayoutEnabled() && valueLayerChanged);
+  if (analogDialLayer != nullptr && analogLayoutEnabled())
+    lv_obj_invalidate(analogDialLayer);
+  invalidateAnalogHands();
 }
 
 void clockDashboardUpdate(const ClockValues &values) {
@@ -1663,10 +3254,66 @@ void clockDashboardUpdate(const ClockValues &values) {
 
   const lv_img_dsc_t *weatherIcon =
       openWeatherIconForCode(values.weatherCode, values.weatherIsDay);
+  if (analogLayoutEnabled()) {
+    lv_obj_add_flag(roomWeatherAnimation, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(roomWeatherImage, LV_OBJ_FLAG_HIDDEN);
+    char desiredAnimationKey[48] = "";
+    const uint8_t effectiveWeatherIconStyle =
+        clockDashboardWeatherIconStyle(configuredWeatherIconStyle);
+    const bool hasDesiredAnimation = weatherAnimationAssetKey(
+        desiredAnimationKey, sizeof(desiredAnimationKey), values.weatherCode,
+        values.weatherIsDay, effectiveWeatherIconStyle);
+    const bool useAnimation =
+        animatedWeatherIconsEnabled && weatherAnimationAvailable &&
+        !weatherAnimationRevealPending && hasDesiredAnimation &&
+        strcmp(desiredAnimationKey, weatherAnimationKey) == 0;
+    if (!weatherConfigured || weatherIcon == nullptr || useAnimation) {
+      lv_obj_add_flag(weatherImage, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_img_set_src(weatherImage, weatherIcon);
+      lv_img_set_zoom(weatherImage, 256);
+      alignCenter(weatherImage, 0, -70);
+      lv_obj_clear_flag(weatherImage, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (weatherConfigured && useAnimation) {
+      alignCenter(weatherAnimation, 0, -70);
+      lv_obj_clear_flag(weatherAnimation, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(weatherAnimation, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    setAnalogTemperature(analogOutsideValueLabel, analogOutsideDecimalLabel,
+                         analogOutsideUnitLabel, values.leftTemperatureC,
+                         outsideDecimals, outsideUnit, -112, 28);
+    setAnalogTemperature(analogRoomValueLabel, analogRoomDecimalLabel,
+                         analogRoomUnitLabel, values.rightTemperatureC,
+                         roomDecimals, roomUnit, 112, 28);
+    const bool metricAChanged = setAnalogValue(
+        analogMetricAValueLabel, analogMetricAUnitLabel, values.metricAValue,
+        metricAConfig.decimals, metricAConfig.suffix, 28, 98);
+    const bool metricBChanged = setAnalogValue(
+        analogMetricBValueLabel, analogMetricBUnitLabel, values.metricBValue,
+        metricBConfig.decimals, metricBConfig.suffix, 28, 140);
+    if (metricAChanged)
+      alignAnalogMetricLine(analogMetricATitleLabel, analogMetricAValueLabel,
+                            analogMetricAUnitLabel, 98);
+    if (metricBChanged)
+      alignAnalogMetricLine(analogMetricBTitleLabel, analogMetricBValueLabel,
+                            analogMetricBUnitLabel, 140, 4);
+    if (metricAChanged || metricBChanged) updateAnalogMetricDivider();
+    applyAnalogColors();
+    applyConnectionStatusColors();
+    if (automaticDayNightEnabled && currentValues.sunStateAvailable) {
+      const bool lightForcesDay = currentValues.dayNightLightStateAvailable &&
+                                  currentValues.dayNightLightOn;
+      clockDashboardSetNightMode(!currentValues.weatherIsDay &&
+                                 !lightForcesDay);
+    }
+    return;
+  }
   char desiredAnimationKey[48] = "";
   const uint8_t effectiveWeatherIconStyle =
-      redNightVisualEnabled() ? CLOCK_WEATHER_ICON_STYLE_MONOCHROME
-                              : configuredWeatherIconStyle;
+      clockDashboardWeatherIconStyle(configuredWeatherIconStyle);
   const bool hasDesiredAnimation = weatherAnimationAssetKey(
       desiredAnimationKey, sizeof(desiredAnimationKey), values.weatherCode,
       values.weatherIsDay, effectiveWeatherIconStyle);
@@ -1708,6 +3355,23 @@ void clockDashboardUpdate(const ClockValues &values) {
               outsideIntegerLabel, outsideDecimalLabel, outsideUnitLabel);
   setTopValue(values.rightTemperatureC, roomDecimals, 367, roomIntegerLabel,
               roomDecimalLabel, roomUnitLabel);
+  const lv_color_t outsideValueColor =
+      redNightVisualEnabled()
+          ? COLOR_ERROR
+          : metricColorForValue(values.leftTemperatureC,
+                                leftValueColorScale);
+  const lv_color_t roomValueColor =
+      redNightVisualEnabled()
+          ? COLOR_ERROR
+          : metricColorForValue(values.rightTemperatureC,
+                                rightValueColorScale);
+  lv_obj_t *outsideValueLabels[] = {outsideTitleLabel, outsideIntegerLabel,
+                                    outsideDecimalLabel, outsideUnitLabel};
+  lv_obj_t *roomValueLabels[] = {roomTitleLabel, roomIntegerLabel,
+                                 roomDecimalLabel, roomUnitLabel};
+  for (lv_obj_t *label : outsideValueLabels)
+    setTextColor(label, outsideValueColor);
+  for (lv_obj_t *label : roomValueLabels) setTextColor(label, roomValueColor);
 
   formatMetricValue(text, sizeof(text), values.metricAValue,
                     metricAConfig.decimals);
@@ -1765,11 +3429,13 @@ void clockDashboardSetWeatherAnimation(const uint8_t *gifData, size_t size,
 void clockDashboardLoop() {
   if (firmwareUpdateActive) return;
   const unsigned long now = millis();
-  if (settingsVisible && settingsPageIndex == 2 &&
+  if (settingsVisible && settingsPageIndex == SETTINGS_PAGE_COUNT - 1 &&
       now - lastSettingsInfoRefreshAt >= 500) {
     lastSettingsInfoRefreshAt = now;
     char info[64];
-    snprintf(info, sizeof(info), "CPU: %u MHz   PAMĚŤ: %lu kB",
+    snprintf(info, sizeof(info),
+             englishLanguage() ? "CPU: %u MHz   MEMORY: %lu kB"
+                               : "CPU: %u MHz   PAMĚŤ: %lu kB",
              static_cast<unsigned>(getCpuFrequencyMhz()),
              static_cast<unsigned long>(ESP.getFreeHeap() / 1024));
     if (strcmp(displayedDeviceInfo, info) != 0) {
@@ -1783,31 +3449,50 @@ void clockDashboardLoop() {
     char statusText[160] = "";
     switch (snapshot.state) {
       case FirmwareUpdateState::Checking:
-        strlcpy(statusText, "KONTROLUJI AKTUALIZACI", sizeof(statusText));
+        strlcpy(statusText,
+                englishLanguage() ? "CHECKING FOR UPDATE"
+                                  : "KONTROLUJI AKTUALIZACI",
+                sizeof(statusText));
         break;
       case FirmwareUpdateState::Available:
-        snprintf(statusText, sizeof(statusText), "NOVÁ VERZE  %s",
+        snprintf(statusText, sizeof(statusText),
+                 englishLanguage() ? "NEW VERSION  %s" : "NOVÁ VERZE  %s",
                  snapshot.serverVersion);
         break;
       case FirmwareUpdateState::Current:
-        strlcpy(statusText, "FIRMWARE JE AKTUÁLNÍ", sizeof(statusText));
+        strlcpy(statusText,
+                englishLanguage() ? "FIRMWARE IS UP TO DATE"
+                                  : "FIRMWARE JE AKTUÁLNÍ",
+                sizeof(statusText));
         break;
       case FirmwareUpdateState::Downloading:
-        strlcpy(statusText, "STAHUJI AKTUALIZACI", sizeof(statusText));
+        strlcpy(statusText,
+                englishLanguage() ? "DOWNLOADING UPDATE"
+                                  : "STAHUJI AKTUALIZACI",
+                sizeof(statusText));
         break;
       case FirmwareUpdateState::Failed:
-        strlcpy(statusText, "KONTROLA SELHALA", sizeof(statusText));
+        strlcpy(statusText,
+                englishLanguage() ? "UPDATE CHECK FAILED"
+                                  : "KONTROLA SELHALA",
+                sizeof(statusText));
         break;
       case FirmwareUpdateState::Restarting:
-        strlcpy(statusText, "RESTARTUJI ZAŘÍZENÍ", sizeof(statusText));
-        break;
-      default:
         strlcpy(statusText,
+                englishLanguage() ? "RESTARTING DEVICE"
+                                  : "RESTARTUJI ZAŘÍZENÍ",
+                sizeof(statusText));
+        break;
+    default:
+      strlcpy(statusText,
                 firmwareControlsAvailable
                     ? (snapshot.installationSupported
-                           ? "AKTUALIZACE NEZKONTROLOVÁNA"
-                           : "OTA JEN V RELEASE")
-                    : "AKTUALIZACE RUČNĚ PŘES USB",
+                           ? (englishLanguage() ? "UPDATE NOT CHECKED"
+                                                : "AKTUALIZACE NEZKONTROLOVÁNA")
+                           : (englishLanguage() ? "OTA IN RELEASE ONLY"
+                                                : "OTA JEN V RELEASE"))
+                    : (englishLanguage() ? "MANUAL UPDATE VIA USB"
+                                         : "AKTUALIZACE RUČNĚ PŘES USB"),
                 sizeof(statusText));
         break;
     }
@@ -1833,18 +3518,17 @@ void clockDashboardLoop() {
     clockDashboardUpdate(currentValues);
   }
   const bool smoothSecondEffectActive =
-      secondRingEnabled && (secondEffect == CLOCK_SECOND_EFFECT_LINE ||
-                            secondEffect == CLOCK_SECOND_EFFECT_COMET);
+      !analogLayoutEnabled() && secondRingEnabled &&
+      (secondEffect == CLOCK_SECOND_EFFECT_LINE ||
+       secondEffect == CLOCK_SECOND_EFFECT_COMET);
   const bool smoothTimeColonActive =
+      !analogLayoutEnabled() &&
       timeColonEffect == CLOCK_TIME_COLON_FADE;
   if (!secondFadeActive && !smoothSecondEffectActive &&
       !smoothTimeColonActive)
     return;
   const unsigned long frameInterval =
-      secondRingEnabled && secondEffect == CLOCK_SECOND_EFFECT_COMET
-          ? SECOND_COMET_FRAME_MS
-          : (smoothTimeColonActive ? TIME_COLON_FADE_FRAME_MS
-                               : SECOND_FADE_FRAME_MS);
+      SMOOTH_EFFECT_FRAME_MS;
   if (now - lastSecondFadeFrameAt < frameInterval) return;
   lastSecondFadeFrameAt = now;
   if (secondFadeActive || smoothSecondEffectActive) renderSecondRing(now);
@@ -1868,9 +3552,15 @@ void clockDashboardShowSettingsPage(uint8_t page) {
 }
 
 void clockDashboardSetNightMode(bool enabled) {
+  const bool wasRedNight = redNightVisualEnabled();
   const bool modeChanged = nightModeEnabled != enabled;
   nightModeEnabled = enabled;
   if (firmwareUpdateActive) return;
+  if (analogLayoutEnabled() && wasRedNight != redNightVisualEnabled()) {
+    rebuildAnalogDialCache();
+    if (analogDialLayer != nullptr) lv_obj_invalidate(analogDialLayer);
+    invalidateAnalogHands();
+  }
   applyDashboardColors();
   if (modeChanged) clockDashboardUpdate(currentValues);
   if (brightnessPreviewCallback != nullptr) {
@@ -1880,6 +3570,96 @@ void clockDashboardSetNightMode(bool enabled) {
 }
 
 bool clockDashboardNightModeEnabled() { return nightModeEnabled; }
+
+void clockDashboardHandleShortClick() {
+  if (settingsVisible || firmwareUpdateActive) return;
+  if (suppressNextDashboardClick) {
+    suppressNextDashboardClick = false;
+    if (static_cast<long>(millis() - suppressDashboardClickUntil) < 0) return;
+  }
+  if (automaticDayNightEnabled) return;
+  clockDashboardSetNightMode(!nightModeEnabled);
+}
+
+bool clockDashboardRadarVisible() { return radarVisible; }
+
+void clockDashboardSetRadarVisible(bool visible) { setRadarVisible(visible); }
+
+bool clockDashboardAutomaticRotationAllowed() {
+  return radarFeatureAvailable && !settingsVisible && !firmwareUpdateActive;
+}
+
+void clockDashboardSetRadarSnapshot(const uint16_t *pixels,
+                                    const char *frameTime, uint16_t radiusKm,
+                                    const char *message, bool loading,
+                                    bool fullPreparationInProgress,
+                                    bool latestFrame,
+                                    uint8_t currentFrameNumber,
+                                    uint8_t animationFrameCount,
+                                    uint8_t pauseSeconds) {
+  if (!radarFeatureAvailable || radarCanvas == nullptr ||
+      radarStatusLabel == nullptr ||
+      radarTitleLabel == nullptr || radarProgressBar == nullptr)
+    return;
+  radarFullPreparationInProgress = fullPreparationInProgress;
+  if (!redNightVisualEnabled()) {
+    lv_obj_set_style_bg_color(
+        radarProgressBar,
+        fullPreparationInProgress ? COLOR_ERROR : COLOR_OUTSIDE,
+        LV_PART_INDICATOR);
+  }
+  if (pixels != nullptr) {
+    lv_canvas_set_buffer(radarCanvas, const_cast<uint16_t *>(pixels), 480, 480,
+                         LV_IMG_CF_TRUE_COLOR);
+    lv_obj_clear_flag(radarCanvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(radarCanvas);
+  }
+  if (pixels != nullptr && currentFrameNumber > 0 &&
+      animationFrameCount > 1) {
+    lv_bar_set_range(radarProgressBar, 0, animationFrameCount);
+    if (latestFrame) {
+      lv_bar_set_value(radarProgressBar, animationFrameCount, LV_ANIM_OFF);
+      if (pauseSeconds > 0) {
+        lv_obj_set_style_anim_time(
+            radarProgressBar,
+            static_cast<uint32_t>(pauseSeconds) * 1000UL, LV_PART_MAIN);
+        lv_bar_set_value(radarProgressBar, 0, LV_ANIM_ON);
+      } else {
+        lv_bar_set_value(radarProgressBar, 0, LV_ANIM_OFF);
+      }
+    } else {
+      lv_bar_set_value(radarProgressBar, currentFrameNumber, LV_ANIM_OFF);
+    }
+    lv_obj_clear_flag(radarProgressBar, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(radarProgressBar, LV_OBJ_FLAG_HIDDEN);
+  }
+  char title[96];
+  const bool highlightLatestFrame = latestFrame && !redNightVisualEnabled();
+  const char *timePrefix = highlightLatestFrame ? "#65FF45 " : "";
+  const char *timeSuffix = highlightLatestFrame ? "#" : "";
+  if (radiusKm == 0 && frameTime != nullptr && frameTime[0] != '\0')
+    snprintf(title, sizeof(title), englishLanguage() ? "CHMI - CZ - %s%s%s"
+                                                    : "ČHMÚ - ČR - %s%s%s",
+             timePrefix,
+             frameTime, timeSuffix);
+  else if (radiusKm == 0)
+    snprintf(title, sizeof(title), englishLanguage() ? "CHMI - CZ"
+                                                    : "ČHMÚ - ČR");
+  else if (frameTime != nullptr && frameTime[0] != '\0')
+    snprintf(title, sizeof(title),
+             englishLanguage() ? "CHMI - %u km - %s%s%s"
+                               : "ČHMÚ - %u km - %s%s%s",
+             radiusKm,
+             timePrefix, frameTime, timeSuffix);
+  else
+    snprintf(title, sizeof(title), englishLanguage() ? "CHMI - %u km"
+                                                    : "ČHMÚ - %u km",
+             radiusKm);
+  lv_label_set_text(radarTitleLabel, title);
+  lv_label_set_text(radarStatusLabel, "");
+  alignCenter(radarTitleLabel, 0, -205);
+}
 
 void clockDashboardSetWifiAddress(const char *ipAddress) {
   if (firmwareUpdateActive) return;
@@ -1916,13 +3696,19 @@ void clockDashboardSetFirmwareUpdateActive(bool active) {
   if (active) {
     clockDashboardSetFirmwareUpdateBlack(false);
     lv_obj_add_flag(dashboardContent, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(settingsPage, LV_OBJ_FLAG_HIDDEN);
+    if (radarVisible && radarVisibilityCallback != nullptr)
+      radarVisibilityCallback(false);
     lv_obj_clear_flag(firmwareUpdateOverlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(firmwareUpdateOverlay);
   } else {
     lv_obj_add_flag(firmwareUpdateOverlay, LV_OBJ_FLAG_HIDDEN);
     if (settingsVisible) {
       lv_obj_clear_flag(settingsPage, LV_OBJ_FLAG_HIDDEN);
+    } else if (radarVisible) {
+      lv_obj_clear_flag(radarPage, LV_OBJ_FLAG_HIDDEN);
+      if (radarVisibilityCallback != nullptr) radarVisibilityCallback(true);
     } else {
       lv_obj_clear_flag(dashboardContent, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1981,15 +3767,45 @@ void clockDashboardSetWebMode(uint8_t mode) {
 
 void clockDashboardSetDate(const char *dateText) {
   if (firmwareUpdateActive) return;
+  if (strcmp(lv_label_get_text(dateLabel), dateText) == 0) return;
   lv_label_set_text(dateLabel, dateText);
-  alignCenter(dateLabel, 0, -43);
+  alignCenter(dateLabel, 0, analogLayoutEnabled() ? -132 : -43);
 }
 
 void clockDashboardSetSecond(uint8_t second) {
   if (firmwareUpdateActive) return;
   if (second > SECOND_DOT_COUNT) second = SECOND_DOT_COUNT;
   if (displayedSecond == second) return;
+  const bool analogLayout = analogLayoutEnabled();
   const bool minuteRolledOver = displayedSecond >= 59 && second <= 1;
+  float oldHourAngle = 0.0f;
+  float oldMinuteAngle = 0.0f;
+  float oldSecondAngle = 0.0f;
+  float newHourAngle = 0.0f;
+  float newMinuteAngle = 0.0f;
+  float newSecondAngle = 0.0f;
+  bool anglesAvailable = false;
+  bool hourChanged = true;
+  bool minuteChanged = true;
+  if (analogLayout) {
+    anglesAvailable =
+        analogHandAngles(oldHourAngle, oldMinuteAngle, oldSecondAngle) &&
+        analogHandAnglesForSecond(second, newHourAngle, newMinuteAngle,
+                                  newSecondAngle);
+    if (anglesAvailable) {
+      hourChanged = analogHandGeometryChanged(
+          oldHourAngle, newHourAngle, 16.0f, 145.0f, 15);
+      minuteChanged = analogHandGeometryChanged(
+          oldMinuteAngle, newMinuteAngle, 20.0f, 178.0f, 12);
+      if (hourChanged)
+        invalidateAnalogHandArea(oldHourAngle, 22.0f, 145.0f, 21);
+      if (minuteChanged)
+        invalidateAnalogHandArea(oldMinuteAngle, 25.0f, 178.0f, 17);
+      invalidateAnalogHandArea(oldSecondAngle, 34.0f, 192.0f, 3);
+    } else {
+      invalidateAnalogHands();
+    }
+  }
   displayedSecond = second;
   secondTickStartedAt = millis();
   lastRenderedTimeColonColor = UINT32_MAX;
@@ -1998,14 +3814,37 @@ void clockDashboardSetSecond(uint8_t second) {
     secondFadeStartedAt = millis();
     lastSecondFadeFrameAt = 0;
   }
-  renderSecondRing(millis());
+  if (analogLayout) {
+    secondFadeActive = false;
+    if (anglesAvailable) {
+      if (hourChanged)
+        invalidateAnalogHandArea(newHourAngle, 22.0f, 145.0f, 21);
+      if (minuteChanged)
+        invalidateAnalogHandArea(newMinuteAngle, 25.0f, 178.0f, 17);
+      invalidateAnalogHandArea(newSecondAngle, 34.0f, 192.0f, 3);
+    } else {
+      invalidateAnalogHands(false, true);
+    }
+  } else {
+    renderSecondRing(millis());
+  }
   if (timeColonEffect != CLOCK_TIME_COLON_STEADY)
     renderTimeColon(millis(), true);
 }
 
 void clockDashboardSetTime(const char *timeText) {
   if (firmwareUpdateActive) return;
+  if (analogLayoutEnabled() && strcmp(displayedTimeText, timeText) == 0) {
+    lv_obj_add_flag(timeLabel, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
   lv_obj_set_style_text_font(timeLabel, configuredTimeFont(), 0);
+  if (analogLayoutEnabled()) invalidateAnalogHands(true, false);
   strlcpy(displayedTimeText, timeText, sizeof(displayedTimeText));
+  if (analogLayoutEnabled()) {
+    lv_obj_add_flag(timeLabel, LV_OBJ_FLAG_HIDDEN);
+    invalidateAnalogHands(true, false);
+    return;
+  }
   renderTimeColon(millis(), true);
 }

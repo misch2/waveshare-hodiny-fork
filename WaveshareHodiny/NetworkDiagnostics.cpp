@@ -47,6 +47,7 @@ void networkDiagnosticsEnd(NetworkDiagnosticKind kind, bool success,
   const NetworkMemorySnapshot memory = networkDiagnosticsCurrentMemory();
   portENTER_CRITICAL(&diagnosticsMux);
   NetworkDiagnosticSnapshot &snapshot = snapshots[indexFor(kind)];
+  snapshot.lastSuccess = success;
   if (success) {
     ++snapshot.successes;
   } else {
@@ -55,6 +56,12 @@ void networkDiagnosticsEnd(NetworkDiagnosticKind kind, bool success,
   snapshot.lastResult = result;
   snapshot.lastFinishedAt = millis();
   snapshot.after = memory;
+  portEXIT_CRITICAL(&diagnosticsMux);
+}
+
+void networkDiagnosticsReset(NetworkDiagnosticKind kind) {
+  portENTER_CRITICAL(&diagnosticsMux);
+  snapshots[indexFor(kind)] = NetworkDiagnosticSnapshot{};
   portEXIT_CRITICAL(&diagnosticsMux);
 }
 
