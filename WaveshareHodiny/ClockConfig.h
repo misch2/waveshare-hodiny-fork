@@ -11,16 +11,39 @@ constexpr size_t CLOCK_METRIC_SUFFIX_LENGTH = 16;
 constexpr size_t CLOCK_ROOM_ICON_LENGTH = 16;
 constexpr size_t CLOCK_OPEN_METEO_CITY_LENGTH = 64;
 constexpr size_t CLOCK_OPEN_METEO_VALUE_LENGTH = 32;
+constexpr size_t CLOCK_TMEP_EXPORT_KEY_LENGTH = 128;
+constexpr size_t CLOCK_TMEP_EXPORT_ID_LENGTH = 16;
+constexpr size_t CLOCK_TMEP_SENSOR_ID_LENGTH = 16;
+constexpr size_t CLOCK_TMEP_FIELD_LENGTH = 16;
+constexpr size_t CLOCK_TMEP_UNIT_LENGTH = 16;
 constexpr size_t CLOCK_METRIC_COLOR_POINT_COUNT = 10;
-// Schema 16 is the public 1.4.0 baseline. Schema 17 adds Open-Meteo and
-// schema 18 adds the clock colon animation and leading-zero preferences;
-// schema 19 expands the colon animation from a switch to three modes and
-// schema 20 adds the selectable date format.
-constexpr uint32_t CLOCK_CONFIG_SCHEMA_VERSION = 20;
+// Schema 20 is the public 1.5.5 baseline. Schema 24 added CHMI radar settings
+// plus automatic clock/radar rotation. Schema 25 added the persistent UI
+// language; schema 26 distinguishes an as-yet unselected language and uses
+// the remaining byte for CHMI radar country availability.
+// Intermediate development schemas were never released.
+// Schema 27 adds optional TMEP credentials parsed from an export URL and a
+// TMEP source descriptor for each of the four Open-Meteo dashboard positions.
+// Schema 28 appends generic formatting and color scales for the two top Home
+// Assistant values. The complete schema 27 prefix stays byte-for-byte
+// unchanged so existing temperature-only configuration can be migrated safely.
+constexpr uint32_t CLOCK_CONFIG_SCHEMA_VERSION = 28;
+
+enum ClockLanguage : uint8_t {
+  CLOCK_LANGUAGE_UNSET = 0,
+  CLOCK_LANGUAGE_CZECH = 1,
+  CLOCK_LANGUAGE_ENGLISH = 2,
+};
 
 enum ClockDataSource : uint8_t {
   CLOCK_DATA_SOURCE_OPEN_METEO = 0,
   CLOCK_DATA_SOURCE_HOME_ASSISTANT = 1,
+};
+
+enum ClockLocationCountry : uint8_t {
+  CLOCK_LOCATION_COUNTRY_UNKNOWN = 0,
+  CLOCK_LOCATION_COUNTRY_CZECHIA = 1,
+  CLOCK_LOCATION_COUNTRY_OTHER = 2,
 };
 
 enum ClockSecondEffect : uint8_t {
@@ -59,6 +82,26 @@ enum ClockDateFormat : uint8_t {
   CLOCK_DATE_FORMAT_DAY_MONTH_YEAR = 2,
   CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR = 3,
   CLOCK_DATE_FORMAT_HIDDEN = 4,
+  CLOCK_DATE_FORMAT_DAY_MONTH = 5,
+};
+
+enum ClockStyle : uint8_t {
+  CLOCK_STYLE_DIGITAL = 0,
+  CLOCK_STYLE_ANALOG = 1,
+};
+
+struct ClockAppearanceConfig {
+  uint8_t style = CLOCK_STYLE_DIGITAL;
+  uint32_t analogToneColor = 0x00D6FF;
+  uint32_t analogHandToneColor = 0x00D6FF;
+  uint32_t analogCardinalAccentColor = 0xFFAB00;
+  bool analogCardinalAccentsEnabled = true;
+  bool analogOutlineHandsEnabled = false;
+  bool analogMonochromeValuesEnabled = false;
+  bool analogValuesAboveHandsEnabled = false;
+  uint8_t analogDateFormat = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH;
+  uint32_t analogDateColor = 0xB5B5B5;
+  uint32_t monochromeWeatherIconColor = 0xFFFFFF;
 };
 
 struct ClockMetricConfig {
@@ -77,6 +120,13 @@ struct ClockSideConfig {
   uint32_t color = 0xFFFFFF;
 };
 
+struct ClockSideValueConfig {
+  bool custom = false;
+  char preset[16] = "temperature";
+  char suffix[CLOCK_METRIC_SUFFIX_LENGTH] = "°C";
+  uint8_t decimals = 1;
+};
+
 struct ClockMetricColorPoint {
   float value = 0.0f;
   uint32_t color = 0xFFFFFF;
@@ -91,6 +141,14 @@ struct ClockOpenMeteoSlotConfig {
   char value[CLOCK_OPEN_METEO_VALUE_LENGTH] = "temperature_2m";
   char name[CLOCK_METRIC_NAME_LENGTH] = "TEPLOTA";
   uint32_t color = 0xFFFFFF;
+};
+
+struct ClockTmepSlotConfig {
+  bool enabled = false;
+  char sensorId[CLOCK_TMEP_SENSOR_ID_LENGTH] = "";
+  char field[CLOCK_TMEP_FIELD_LENGTH] = "";
+  char unit[CLOCK_TMEP_UNIT_LENGTH] = "";
+  uint8_t decimals = 1;
 };
 
 struct ClockConfig {
@@ -136,12 +194,44 @@ struct ClockConfig {
   uint8_t timeColonEffect = CLOCK_TIME_COLON_STEADY;
   bool showLeadingHourZero = true;
   uint8_t dateFormat = CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH;
+  uint16_t radarRadiusKm = 0;
+  uint8_t radarFrameCount = 6;
+  bool automaticRadarRotation = false;
+  uint16_t clockDisplaySeconds = 120;
+  uint16_t radarDisplaySeconds = 20;
+  uint8_t radarMapOpacity = 100;
+  uint8_t radarPauseSeconds = 5;
+  uint8_t language = CLOCK_LANGUAGE_UNSET;
+  uint8_t openMeteoCountry = CLOCK_LOCATION_COUNTRY_CZECHIA;
+  char tmepExportKey[CLOCK_TMEP_EXPORT_KEY_LENGTH] = "";
+  char tmepExportId[CLOCK_TMEP_EXPORT_ID_LENGTH] = "";
+  ClockTmepSlotConfig tmepSlots[4];
+  ClockSideValueConfig leftValue;
+  ClockSideValueConfig rightValue;
+  ClockMetricColorScale leftValueColorScale;
+  ClockMetricColorScale rightValueColorScale;
 };
+
+static_assert(offsetof(ClockConfig, language) == 2106 &&
+                  offsetof(ClockConfig, openMeteoCountry) == 2107 &&
+                  offsetof(ClockConfig, tmepExportKey) == 2108 &&
+                  offsetof(ClockConfig, leftValue) == 2452 &&
+                  sizeof(ClockTmepSlotConfig) == 50 &&
+                  sizeof(ClockSideValueConfig) == 34 &&
+                  sizeof(ClockConfig) == 2688,
+              "Schema 28 must preserve the complete schema 27 prefix.");
 
 bool clockConfigBegin();
 bool clockConfigLoad(ClockConfig &config);
 bool clockConfigSave(const ClockConfig &config);
 void clockConfigApplyDefaults(ClockConfig &config);
+bool clockConfigRadarAvailable(const ClockConfig &config);
+bool clockAppearanceLoad(ClockAppearanceConfig &appearance,
+                         uint32_t defaultMonochromeWeatherIconColor = 0xFFFFFF,
+                         uint8_t defaultAnalogDateFormat =
+                             CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH,
+                         uint32_t defaultAnalogDateColor = 0xB5B5B5);
+bool clockAppearanceSave(const ClockAppearanceConfig &appearance);
 
 void clockConfigCopy(char *destination, size_t destinationSize,
                      const String &value);

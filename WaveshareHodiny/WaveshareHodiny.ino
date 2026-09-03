@@ -3,12 +3,15 @@
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>
 #include <esp_sntp.h>
 #include <esp_task_wdt.h>
+#include <freertos/idf_additions.h>
 #include <time.h>
 
 #include "ClockDashboard.h"
 #include "ClockConfig.h"
+#include "ChmiRadarService.h"
 #include "ConfigurationWeb.h"
 #include "DayNightLogic.h"
 #include "DisplayDriver.h"
@@ -19,9 +22,16 @@
 #include "I2C_Driver.h"
 #include "ImprovSerialService.h"
 #include "NetworkDiagnostics.h"
+#include "NetworkCoordinator.h"
 #include "TCA9554PWR.h"
+#include "TmepService.h"
 #include "WifiProvisioning.h"
 #include "WeatherAnimationService.h"
+
+// ClockConfig is intentionally copied under a mutex so the web server and
+// background data task always see a consistent snapshot. Keep enough room for
+// that snapshot and the display/network calls made from Arduino's loop task.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 #if !FIRMWARE_RELEASE && __has_include("local/secrets.h")
 #include "local/secrets.h"
@@ -46,12 +56,18 @@ ClockConfig runtimeConfig;
 ClockConfig persistedConfig;
 ClockConfig configSaveBuffer;
 ClockConfig dashboardConfigBuffer;
+ClockAppearanceConfig persistedAppearance;
+ClockAppearanceConfig activeAppearance;
+ClockAppearanceConfig pendingAppearance;
 SemaphoreHandle_t runtimeConfigMutex = nullptr;
 TaskHandle_t homeAssistantTaskHandle = nullptr;
 String usbCommand;
 bool screenshotTransferActive = false;
 unsigned long displayResyncAt = 0;
 int lastDisplayedSecond = -1;
+#if !FIRMWARE_RELEASE
+int32_t displayTimeOffsetSeconds = 0;
+#endif
 bool wifiWasConnected = false;
 bool timeWasSynchronized = false;
 ClockValues pendingHomeAssistantValues;
@@ -62,6 +78,7 @@ portMUX_TYPE dayNightLightRefreshMux = portMUX_INITIALIZER_UNLOCKED;
 bool mdnsStarted = false;
 String displayedWifiIp;
 bool runtimeConfigurationApplyPending = false;
+bool clockAppearanceApplyPending = false;
 unsigned long runtimeConfigurationApplyAt = 0;
 int lastAutomaticFirmwareCheckDate = -1;
 unsigned long lastFirmwareDisplayRefreshAt = 0;
@@ -81,6 +98,16 @@ volatile bool firmwareUpdateCountdownStarted = false;
 volatile unsigned long firmwareUpdateCountdownStartedAt = 0;
 uint8_t firmwareUpdateCountdownDisplayed = 0;
 bool firmwareUpdateDisplayActive = false;
+uint32_t displayedRadarGeneration = UINT32_MAX;
+char displayedRadarTime[6] = "";
+uint16_t displayedRadarRadiusKm = 50;
+bool radarRadiusApplyPending = false;
+unsigned long radarRadiusApplyAt = 0;
+bool automaticRadarRotationPaused = true;
+unsigned long displayModeStartedAt = 0;
+bool radarRotationWaitingForCycle = false;
+uint32_t radarRotationCycleAtTimeout = 0;
+bool radarRedNightModeApplied = false;
 
 constexpr uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 20UL * 1000UL;
 constexpr uint32_t NTP_SYNC_INTERVAL_MS = 60UL * 60UL * 1000UL;
@@ -91,6 +118,8 @@ constexpr uint32_t HOME_ASSISTANT_RESPONSE_TIMEOUT_MS = 8000;
 constexpr uint8_t HOME_ASSISTANT_REQUEST_ATTEMPTS = 2;
 constexpr uint32_t HOME_ASSISTANT_REQUEST_RETRY_DELAY_MS = 250;
 constexpr uint32_t OPEN_METEO_REFRESH_MS = 10UL * 60UL * 1000UL;
+constexpr uint32_t TMEP_REFRESH_MS = 60UL * 1000UL;
+constexpr uint32_t EXTERNAL_DATA_RETRY_MS = 60UL * 1000UL;
 constexpr time_t VALID_TIME_THRESHOLD = 1700000000;
 
 const char *CZECH_WEEKDAYS[] = {
@@ -100,6 +129,14 @@ const char *CZECH_WEEKDAYS[] = {
 const char *CZECH_MONTHS[] = {
     "LEDNA", "ÚNORA", "BŘEZNA", "DUBNA", "KVĚTNA", "ČERVNA",
     "ČERVENCE", "SRPNA", "ZÁŘÍ", "ŘÍJNA", "LISTOPADU", "PROSINCE",
+};
+const char *ENGLISH_WEEKDAYS[] = {
+    "SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY",
+    "THURSDAY", "FRIDAY", "SATURDAY",
+};
+const char *ENGLISH_MONTHS[] = {
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+    "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
 };
 
 void applyDevelopmentDefaults(ClockConfig &config);
@@ -131,6 +168,7 @@ bool saveRuntimeConfig(const ClockConfig &config, bool tokenWasSubmitted) {
                     persistedConfig.homeAssistantToken);
   }
   if (!clockConfigSave(configSaveBuffer)) return false;
+  radarRadiusApplyPending = false;
   xSemaphoreTake(runtimeConfigMutex, portMAX_DELAY);
   persistedConfig = configSaveBuffer;
   runtimeConfig = configSaveBuffer;
@@ -142,6 +180,59 @@ bool saveRuntimeConfig(const ClockConfig &config, bool tokenWasSubmitted) {
   return true;
 }
 
+void loadClockAppearanceForWeb(ClockAppearanceConfig &saved,
+                               ClockAppearanceConfig &active) {
+  saved = persistedAppearance;
+  active = activeAppearance;
+}
+
+bool previewClockAppearanceFromWeb(const ClockAppearanceConfig &appearance) {
+  activeAppearance = appearance;
+  activeAppearance.style = constrain(
+      activeAppearance.style, static_cast<uint8_t>(CLOCK_STYLE_DIGITAL),
+      static_cast<uint8_t>(CLOCK_STYLE_ANALOG));
+  activeAppearance.analogToneColor &= 0xFFFFFF;
+  activeAppearance.analogHandToneColor &= 0xFFFFFF;
+  activeAppearance.analogCardinalAccentColor &= 0xFFFFFF;
+  activeAppearance.analogDateFormat = constrain(
+      activeAppearance.analogDateFormat,
+      static_cast<uint8_t>(CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH),
+      static_cast<uint8_t>(CLOCK_DATE_FORMAT_DAY_MONTH));
+  activeAppearance.analogDateColor &= 0xFFFFFF;
+  activeAppearance.monochromeWeatherIconColor &= 0xFFFFFF;
+  pendingAppearance = activeAppearance;
+  clockAppearanceApplyPending = true;
+  return true;
+}
+
+bool saveClockAppearanceFromWeb(const ClockAppearanceConfig &appearance) {
+  ClockAppearanceConfig normalized = appearance;
+  normalized.style = constrain(
+      normalized.style, static_cast<uint8_t>(CLOCK_STYLE_DIGITAL),
+      static_cast<uint8_t>(CLOCK_STYLE_ANALOG));
+  normalized.analogToneColor &= 0xFFFFFF;
+  normalized.analogHandToneColor &= 0xFFFFFF;
+  normalized.analogCardinalAccentColor &= 0xFFFFFF;
+  normalized.analogDateFormat = constrain(
+      normalized.analogDateFormat,
+      static_cast<uint8_t>(CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH),
+      static_cast<uint8_t>(CLOCK_DATE_FORMAT_DAY_MONTH));
+  normalized.analogDateColor &= 0xFFFFFF;
+  normalized.monochromeWeatherIconColor &= 0xFFFFFF;
+  if (!clockAppearanceSave(normalized)) return false;
+  persistedAppearance = normalized;
+  activeAppearance = normalized;
+  pendingAppearance = normalized;
+  clockAppearanceApplyPending = true;
+  return true;
+}
+
+void applyPendingClockAppearance() {
+  if (!clockAppearanceApplyPending) return;
+  clockAppearanceApplyPending = false;
+  clockDashboardApplyAppearance(pendingAppearance);
+}
+
 void applyPendingRuntimeConfiguration() {
   if (!runtimeConfigurationApplyPending ||
       static_cast<long>(millis() - runtimeConfigurationApplyAt) < 0) {
@@ -149,10 +240,23 @@ void applyPendingRuntimeConfiguration() {
   }
   runtimeConfigurationApplyPending = false;
   runtimeConfigurationApplyAt = 0;
+  automaticRadarRotationPaused = true;
+  radarRotationWaitingForCycle = false;
   xSemaphoreTake(runtimeConfigMutex, portMAX_DELAY);
   dashboardConfigBuffer = runtimeConfig;
   xSemaphoreGive(runtimeConfigMutex);
   clockDashboardApplyConfiguration(dashboardConfigBuffer);
+  const bool radarAvailable =
+      clockConfigRadarAvailable(dashboardConfigBuffer);
+  chmiRadarServiceSetActive(
+      radarAvailable && clockDashboardRadarVisible(),
+      radarAvailable && dashboardConfigBuffer.automaticRadarRotation,
+      dashboardConfigBuffer.openMeteoLatitude,
+      dashboardConfigBuffer.openMeteoLongitude,
+      dashboardConfigBuffer.radarRadiusKm,
+      dashboardConfigBuffer.radarFrameCount,
+      dashboardConfigBuffer.radarMapOpacity,
+      dashboardConfigBuffer.radarPauseSeconds);
   // Zápis do flash může na ESP32-S3 rozhodit vertikální synchronizaci RGB
   // panelu. Provádíme ji až po dokončení obsluhy HTTP požadavku.
   LCD_Resync();
@@ -224,6 +328,199 @@ void handleSettingsOpen() {
   clockDashboardSetWebMode(configurationWebMode());
 }
 
+void handleRadarVisibility(bool visible) {
+  displayModeStartedAt = millis();
+  automaticRadarRotationPaused = false;
+  radarRotationWaitingForCycle = false;
+  const ClockConfig config = runtimeConfigSnapshot();
+  const bool radarAvailable = clockConfigRadarAvailable(config);
+  chmiRadarServiceSetActive(radarAvailable && visible,
+                            radarAvailable && config.automaticRadarRotation,
+                            config.openMeteoLatitude,
+                            config.openMeteoLongitude, config.radarRadiusKm,
+                            config.radarFrameCount, config.radarMapOpacity,
+                            config.radarPauseSeconds);
+}
+
+void handleRadarRangeChange(int8_t direction) {
+  static constexpr uint16_t RADAR_RADII[] = {25, 50, 100, 200, 0};
+  ClockConfig config = runtimeConfigSnapshot();
+  if (!clockConfigRadarAvailable(config)) return;
+  size_t index = 1;
+  for (size_t candidate = 0; candidate < 5; ++candidate) {
+    if (RADAR_RADII[candidate] == config.radarRadiusKm) {
+      index = candidate;
+      break;
+    }
+  }
+  if (direction > 0 && index + 1 < 5)
+    ++index;
+  else if (direction < 0 && index > 0)
+    --index;
+  else
+    return;
+  xSemaphoreTake(runtimeConfigMutex, portMAX_DELAY);
+  runtimeConfig.radarRadiusKm = RADAR_RADII[index];
+  xSemaphoreGive(runtimeConfigMutex);
+  radarRadiusApplyPending = true;
+  radarRadiusApplyAt = millis() + 350;
+  displayModeStartedAt = millis();
+  radarRotationWaitingForCycle = false;
+}
+
+void maintainRadarRangeChange() {
+  if (radarRadiusApplyPending &&
+      static_cast<long>(millis() - radarRadiusApplyAt) >= 0) {
+    radarRadiusApplyPending = false;
+    radarRadiusApplyAt = 0;
+    const ClockConfig config = runtimeConfigSnapshot();
+    if (clockConfigRadarAvailable(config) &&
+        (clockDashboardRadarVisible() || config.automaticRadarRotation)) {
+      chmiRadarServiceSetActive(clockDashboardRadarVisible(),
+                                config.automaticRadarRotation,
+                                config.openMeteoLatitude,
+                                config.openMeteoLongitude,
+                                config.radarRadiusKm,
+                                config.radarFrameCount,
+                                config.radarMapOpacity,
+                                config.radarPauseSeconds);
+    }
+  }
+}
+
+void loadRadarRangeStateForWeb(uint16_t &savedRadiusKm,
+                               uint16_t &activeRadiusKm) {
+  savedRadiusKm = persistedConfig.radarRadiusKm;
+  activeRadiusKm = runtimeConfigSnapshot().radarRadiusKm;
+}
+
+bool previewRadarRangeFromWeb(uint16_t radiusKm) {
+  xSemaphoreTake(runtimeConfigMutex, portMAX_DELAY);
+  if (!clockConfigRadarAvailable(runtimeConfig)) {
+    xSemaphoreGive(runtimeConfigMutex);
+    return false;
+  }
+  runtimeConfig.radarRadiusKm = radiusKm;
+  const ClockConfig config = runtimeConfig;
+  xSemaphoreGive(runtimeConfigMutex);
+  radarRadiusApplyPending = false;
+  radarRadiusApplyAt = 0;
+  displayModeStartedAt = millis();
+  radarRotationWaitingForCycle = false;
+  if (clockDashboardRadarVisible() || config.automaticRadarRotation) {
+    chmiRadarServiceSetActive(clockDashboardRadarVisible(),
+                              config.automaticRadarRotation,
+                              config.openMeteoLatitude,
+                              config.openMeteoLongitude,
+                              config.radarRadiusKm,
+                              config.radarFrameCount,
+                              config.radarMapOpacity,
+                              config.radarPauseSeconds);
+  }
+  return true;
+}
+
+void maintainAutomaticRadarRotation() {
+  const ClockConfig config = runtimeConfigSnapshot();
+  const bool allowed =
+      clockConfigRadarAvailable(config) && config.automaticRadarRotation &&
+      WiFi.status() == WL_CONNECTED && timeWasSynchronized &&
+      !displayForcedOff &&
+      clockDashboardAutomaticRotationAllowed();
+  if (!allowed) {
+    automaticRadarRotationPaused = true;
+    radarRotationWaitingForCycle = false;
+    return;
+  }
+  const unsigned long now = millis();
+  if (automaticRadarRotationPaused) {
+    automaticRadarRotationPaused = false;
+    displayModeStartedAt = now;
+    radarRotationWaitingForCycle = false;
+    return;
+  }
+  const bool radarVisible = clockDashboardRadarVisible();
+  const unsigned long durationMs =
+      static_cast<unsigned long>(radarVisible ? config.radarDisplaySeconds
+                                              : config.clockDisplaySeconds) *
+      1000UL;
+  if (now - displayModeStartedAt < durationMs) return;
+  if (radarVisible) {
+    ChmiRadarSnapshot snapshot;
+    chmiRadarServiceSnapshot(snapshot);
+    const bool staticRadarReady =
+        snapshot.ready && snapshot.animationFrameCount <= 1;
+    if (!staticRadarReady) {
+      if (!radarRotationWaitingForCycle) {
+        // Nastavený čas je pouze minimum. Od této chvíle čekáme na dokončení
+        // právě rozběhnutého cyklu včetně koncové pauzy.
+        radarRotationWaitingForCycle = true;
+        radarRotationCycleAtTimeout = snapshot.completedAnimationCycles;
+        return;
+      }
+      if (snapshot.completedAnimationCycles == radarRotationCycleAtTimeout)
+        return;
+    }
+  } else {
+    ChmiRadarSnapshot snapshot;
+    chmiRadarServiceSnapshot(snapshot);
+    const bool completeAnimationReady =
+        snapshot.ready && !snapshot.loading &&
+        !snapshot.fullPreparationInProgress &&
+        snapshot.animationFrameCount == config.radarFrameCount;
+    // Automatická rotace nesmí poprvé otevřít radar uprostřed přípravy.
+    // Ruční gesto zůstává neblokované a může radar zobrazit kdykoliv.
+    if (!completeAnimationReady) return;
+  }
+  clockDashboardSetRadarVisible(!radarVisible);
+}
+
+void maintainDisplayGestures() {
+  const bool radarAvailable =
+      clockConfigRadarAvailable(runtimeConfigSnapshot());
+  if (displayDriverTakeHorizontalSwipe() &&
+      radarAvailable && clockDashboardAutomaticRotationAllowed()) {
+    clockDashboardSetRadarVisible(!clockDashboardRadarVisible());
+  }
+  const int8_t verticalSwipeDirection = displayDriverTakeVerticalSwipe();
+  if (verticalSwipeDirection != 0 && radarAvailable &&
+      clockDashboardRadarVisible() &&
+      clockDashboardAutomaticRotationAllowed()) {
+    handleRadarRangeChange(verticalSwipeDirection);
+  }
+  if (displayDriverTakeSingleClick()) clockDashboardHandleShortClick();
+}
+
+void maintainRadarDisplay() {
+  ChmiRadarSnapshot snapshot;
+  chmiRadarServiceSnapshot(snapshot);
+  if (snapshot.generation == displayedRadarGeneration &&
+      strcmp(snapshot.frameTime, displayedRadarTime) == 0)
+    return;
+  displayedRadarGeneration = snapshot.generation;
+  displayedRadarRadiusKm = snapshot.radiusKm;
+  strlcpy(displayedRadarTime, snapshot.frameTime,
+          sizeof(displayedRadarTime));
+  clockDashboardSetRadarSnapshot(snapshot.pixels, snapshot.frameTime,
+                                 displayedRadarRadiusKm,
+                                 snapshot.message, snapshot.loading,
+                                 snapshot.fullPreparationInProgress,
+                                 snapshot.latestFrame,
+                                 snapshot.currentFrameNumber,
+                                 snapshot.animationFrameCount,
+                                 snapshot.pauseSeconds);
+}
+
+void maintainRadarNightVisual() {
+  const ClockConfig config = runtimeConfigSnapshot();
+  const bool enabled =
+      clockDashboardNightModeEnabled() &&
+      config.nightVisualMode == CLOCK_NIGHT_VISUAL_RED;
+  if (radarRedNightModeApplied == enabled) return;
+  radarRedNightModeApplied = enabled;
+  chmiRadarServiceSetRedNightMode(enabled);
+}
+
 void handleConfigurationWebStatus(bool active) {
   clockDashboardSetWebActive(active);
 }
@@ -261,7 +558,8 @@ void loadDayNightStatusForWeb(bool &sunAvailable, bool &sunIsDay,
   nightMode = clockDashboardNightModeEnabled();
 }
 
-void handleSettingsSave(uint8_t dayBrightness, uint8_t nightBrightness,
+void handleSettingsSave(uint8_t clockStyle, uint8_t dayBrightness,
+                        uint8_t nightBrightness,
                         bool automaticDayNight, bool secondRingEnabled,
                         uint8_t selectedSecondEffect,
                         bool animatedWeatherIcons, uint8_t weatherIconStyle,
@@ -276,6 +574,12 @@ void handleSettingsSave(uint8_t dayBrightness, uint8_t nightBrightness,
   config.weatherIconStyle = weatherIconStyle;
   config.automaticFirmwareUpdate = automaticFirmwareUpdate;
   if (saveRuntimeConfig(config, false)) {
+    ClockAppearanceConfig appearance = persistedAppearance;
+    appearance.style = constrain(
+        clockStyle, static_cast<uint8_t>(CLOCK_STYLE_DIGITAL),
+        static_cast<uint8_t>(CLOCK_STYLE_ANALOG));
+    if (appearance.style != persistedAppearance.style)
+      saveClockAppearanceFromWeb(appearance);
     configurationWebSetMode(static_cast<ConfigurationWebMode>(webMode));
     clockDashboardSetWebMode(configurationWebMode());
   }
@@ -311,6 +615,9 @@ void handleUsbCommands() {
       } else if (usbCommand == "SETTINGS3" && !screenshotTransferActive) {
         clockDashboardShowSettingsPage(2);
         Serial.println("SETTINGS_OPEN");
+      } else if (usbCommand == "SETTINGS4" && !screenshotTransferActive) {
+        clockDashboardShowSettingsPage(3);
+        Serial.println("SETTINGS_OPEN");
       } else if (usbCommand == "NIGHT" && !screenshotTransferActive) {
         clockDashboardSetNightMode(true);
         Serial.println("NIGHT_OPEN");
@@ -331,6 +638,19 @@ void handleUsbCommands() {
       } else if (usbCommand == "WEBUNLOCK" && !screenshotTransferActive) {
         configurationWebUnlockForTest();
         Serial.println("WEB_CONFIG_UNLOCKED");
+      } else if (usbCommand.startsWith("TIMEOFFSET") &&
+                 !screenshotTransferActive) {
+        const String minutesText = usbCommand.substring(10);
+        char *end = nullptr;
+        const long minutes = strtol(minutesText.c_str(), &end, 10);
+        if (end != minutesText.c_str() && *end == '\0' &&
+            minutes >= -720 && minutes <= 720) {
+          displayTimeOffsetSeconds = static_cast<int32_t>(minutes * 60L);
+          lastDisplayedSecond = -1;
+          Serial.printf("TIME_OFFSET_MINUTES=%ld\n", minutes);
+        } else {
+          Serial.println("TIME_OFFSET_ERROR");
+        }
       }
       usbCommand = "";
     } else if (usbCommand.length() < 32) {
@@ -421,13 +741,25 @@ void maintainNetworkTime() {
     if (homeAssistantTaskHandle != nullptr) {
       xTaskNotifyGive(homeAssistantTaskHandle);
     }
+    const ClockConfig config = runtimeConfigSnapshot();
+    const bool radarAvailable = clockConfigRadarAvailable(config);
+    chmiRadarServiceSetActive(
+        radarAvailable && clockDashboardRadarVisible(),
+        radarAvailable && config.automaticRadarRotation,
+        config.openMeteoLatitude, config.openMeteoLongitude,
+        config.radarRadiusKm, config.radarFrameCount,
+        config.radarMapOpacity, config.radarPauseSeconds);
 #if !FIRMWARE_RELEASE
     Serial.println("NTP synchronizovano");
 #endif
   }
 
+  time_t displayedNow = now;
+#if !FIRMWARE_RELEASE
+  displayedNow += displayTimeOffsetSeconds;
+#endif
   struct tm localTime;
-  localtime_r(&now, &localTime);
+  localtime_r(&displayedNow, &localTime);
   if (localTime.tm_sec == lastDisplayedSecond) return;
   lastDisplayedSecond = localTime.tm_sec;
 
@@ -440,34 +772,68 @@ void maintainNetworkTime() {
   clockDashboardSetSecond(static_cast<uint8_t>(localTime.tm_sec));
 
   char dateText[64];
-  switch (config.dateFormat) {
+  const bool english = config.language == CLOCK_LANGUAGE_ENGLISH;
+  const char *const *weekdays = english ? ENGLISH_WEEKDAYS : CZECH_WEEKDAYS;
+  const char *const *months = english ? ENGLISH_MONTHS : CZECH_MONTHS;
+  const uint8_t displayedDateFormat =
+      activeAppearance.style == CLOCK_STYLE_ANALOG
+          ? activeAppearance.analogDateFormat
+          : config.dateFormat;
+  switch (displayedDateFormat) {
     case CLOCK_DATE_FORMAT_HIDDEN:
       dateText[0] = '\0';
       break;
     case CLOCK_DATE_FORMAT_NUMERIC:
-      snprintf(dateText, sizeof(dateText), "%02d.%02d.%04d", localTime.tm_mday,
-               localTime.tm_mon + 1, localTime.tm_year + 1900);
+      if (english) {
+        snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d",
+                 localTime.tm_year + 1900, localTime.tm_mon + 1,
+                 localTime.tm_mday);
+      } else {
+        snprintf(dateText, sizeof(dateText), "%02d.%02d.%04d",
+                 localTime.tm_mday, localTime.tm_mon + 1,
+                 localTime.tm_year + 1900);
+      }
+      break;
+    case CLOCK_DATE_FORMAT_DAY_MONTH:
+      snprintf(dateText, sizeof(dateText), "%02d.%02d.",
+               localTime.tm_mday, localTime.tm_mon + 1);
       break;
     case CLOCK_DATE_FORMAT_DAY_MONTH_YEAR:
-      snprintf(dateText, sizeof(dateText), "%d. %s %d", localTime.tm_mday,
-               CZECH_MONTHS[localTime.tm_mon], localTime.tm_year + 1900);
+      if (english)
+        snprintf(dateText, sizeof(dateText), "%s %d, %d",
+                 months[localTime.tm_mon], localTime.tm_mday,
+                 localTime.tm_year + 1900);
+      else
+        snprintf(dateText, sizeof(dateText), "%d. %s %d", localTime.tm_mday,
+                 months[localTime.tm_mon], localTime.tm_year + 1900);
       break;
     case CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH_YEAR:
-      snprintf(dateText, sizeof(dateText), "%s, %d. %s %d",
-               CZECH_WEEKDAYS[localTime.tm_wday], localTime.tm_mday,
-               CZECH_MONTHS[localTime.tm_mon], localTime.tm_year + 1900);
+      if (english)
+        snprintf(dateText, sizeof(dateText), "%s, %s %d, %d",
+                 weekdays[localTime.tm_wday], months[localTime.tm_mon],
+                 localTime.tm_mday, localTime.tm_year + 1900);
+      else
+        snprintf(dateText, sizeof(dateText), "%s, %d. %s %d",
+                 weekdays[localTime.tm_wday], localTime.tm_mday,
+                 months[localTime.tm_mon], localTime.tm_year + 1900);
       break;
     case CLOCK_DATE_FORMAT_WEEKDAY_DAY_MONTH:
     default:
-      snprintf(dateText, sizeof(dateText), "%s, %d. %s",
-               CZECH_WEEKDAYS[localTime.tm_wday], localTime.tm_mday,
-               CZECH_MONTHS[localTime.tm_mon]);
+      if (english)
+        snprintf(dateText, sizeof(dateText), "%s, %s %d",
+                 weekdays[localTime.tm_wday], months[localTime.tm_mon],
+                 localTime.tm_mday);
+      else
+        snprintf(dateText, sizeof(dateText), "%s, %d. %s",
+                 weekdays[localTime.tm_wday], localTime.tm_mday,
+                 months[localTime.tm_mon]);
       break;
   }
   clockDashboardSetDate(dateText);
 }
 
 void handleFirmwareUpdateLifecycle(bool updating) {
+  weatherAnimationServiceSetFirmwareUpdateActive(updating);
   if (homeAssistantTaskHandle != nullptr) {
     if (updating) {
       vTaskSuspend(homeAssistantTaskHandle);
@@ -495,7 +861,9 @@ void handleFirmwareUpdateLifecycle(bool updating) {
     // Necháme několik obnovovacích cyklů naplnit framebuffer i RGB bounce
     // buffery čistou černou ještě před prvním zápisem OTA do flash.
     delay(500);
+    chmiRadarServicePrepareForFirmwareUpdate();
   } else {
+    chmiRadarServiceBegin();
     firmwareUpdateCountdownStarted = false;
     firmwareUpdateBlackRequested = false;
     displayResyncAt = millis() + 500;
@@ -624,6 +992,12 @@ int openMeteoWeatherCode(int wmoCode) {
 
 bool fetchOpenMeteo(const ClockConfig &config, ClockValues &values) {
   networkDiagnosticsBegin(NetworkDiagnosticKind::OpenMeteoRuntime);
+  NetworkOperationGuard networkGuard(HOME_ASSISTANT_RESPONSE_TIMEOUT_MS);
+  if (!networkGuard) {
+    networkDiagnosticsEnd(NetworkDiagnosticKind::OpenMeteoRuntime, false,
+                          HTTPC_ERROR_CONNECTION_REFUSED);
+    return false;
+  }
   String url = F("https://api.open-meteo.com/v1/forecast?latitude=");
   url += String(config.openMeteoLatitude, 5);
   url += F("&longitude=");
@@ -672,6 +1046,7 @@ bool fetchOpenMeteo(const ClockConfig &config, ClockValues &values) {
   float *destinations[] = {&values.leftTemperatureC, &values.rightTemperatureC,
                            &values.metricAValue, &values.metricBValue};
   for (size_t index = 0; index < 4; ++index) {
+    if (config.tmepSlots[index].enabled) continue;
     if (extractJsonNumberField(payload, config.openMeteoSlots[index].value,
                                number)) {
       *destinations[index] = static_cast<float>(number);
@@ -686,6 +1061,59 @@ bool fetchOpenMeteo(const ClockConfig &config, ClockValues &values) {
                                  : F("Odpověď neobsahuje všechny hodnoty"));
   networkDiagnosticsEnd(NetworkDiagnosticKind::OpenMeteoRuntime, ok, status);
   return ok;
+}
+
+bool tmepSlotsEnabled(const ClockConfig &config) {
+  for (const ClockTmepSlotConfig &slot : config.tmepSlots) {
+    if (slot.enabled) return true;
+  }
+  return false;
+}
+
+struct TmepValuesContext {
+  const ClockConfig &config;
+  ClockValues &values;
+  bool complete = true;
+};
+
+void applyTmepValues(const TmepCatalog &catalog, void *rawContext) {
+  TmepValuesContext &context =
+      *static_cast<TmepValuesContext *>(rawContext);
+  float *destinations[] = {&context.values.leftTemperatureC,
+                           &context.values.rightTemperatureC,
+                           &context.values.metricAValue,
+                           &context.values.metricBValue};
+  for (size_t index = 0; index < 4; ++index) {
+    const ClockTmepSlotConfig &slot = context.config.tmepSlots[index];
+    if (!slot.enabled) continue;
+    const TmepSensor *sensor = tmepFindSensor(catalog, slot.sensorId);
+    const TmepValue *value =
+        sensor == nullptr ? nullptr : tmepFindValue(*sensor, slot.field);
+    if (value == nullptr || !value->available) {
+      *destinations[index] = NAN;
+      context.complete = false;
+      continue;
+    }
+    *destinations[index] = value->value;
+  }
+}
+
+bool fetchTmepValues(const ClockConfig &config, ClockValues &values) {
+  TmepValuesContext context{config, values};
+  int status = HTTPC_ERROR_CONNECTION_REFUSED;
+  String error;
+  if (!tmepFetchCatalog(config.tmepExportId, config.tmepExportKey,
+                        applyTmepValues, &context,
+                        NetworkDiagnosticKind::TmepRuntime, status, error)) {
+    return false;
+  }
+
+  if (!context.complete) {
+    networkDiagnosticsSetDetail(
+        NetworkDiagnosticKind::TmepRuntime,
+        F("Export neobsahuje všechny vybrané hodnoty."));
+  }
+  return context.complete;
 }
 
 bool applyHomeAssistantState(const ClockConfig &config, const String &entityId,
@@ -727,6 +1155,11 @@ bool requestHomeAssistantState(NetworkClient &client,
                                const char *entityId, String &payload,
                                int &lastStatus) {
   if (entityId[0] == '\0') return false;
+  NetworkOperationGuard networkGuard(HOME_ASSISTANT_RESPONSE_TIMEOUT_MS);
+  if (!networkGuard) {
+    lastStatus = HTTPC_ERROR_CONNECTION_REFUSED;
+    return false;
+  }
   const String url = String(config.homeAssistantUrl) + "/api/states/" + entityId;
   for (uint8_t attempt = 0; attempt < HOME_ASSISTANT_REQUEST_ATTEMPTS;
        ++attempt) {
@@ -994,24 +1427,82 @@ int weatherCodeForState(const String &state) {
 
 void homeAssistantTask(void *) {
   ClockValues lastAvailableValues;
+  unsigned long nextOpenMeteoRefreshAt = 0;
+  unsigned long nextTmepRefreshAt = 0;
+  bool tmepCatalogPrimed = false;
   for (;;) {
     const ClockConfig config = runtimeConfigSnapshot();
     ClockValues values = lastAvailableValues;
     if (WiFi.status() != WL_CONNECTED) {
+      nextOpenMeteoRefreshAt = 0;
+      nextTmepRefreshAt = 0;
+      tmepCatalogPrimed = false;
       publishHomeAssistantValues(ClockValues{});
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HOME_ASSISTANT_RETRY_MS));
       continue;
     }
 
     if (config.dataSource == CLOCK_DATA_SOURCE_OPEN_METEO) {
-      const bool apiResponded = fetchOpenMeteo(config, values);
-      if (apiResponded) lastAvailableValues = values;
-      publishHomeAssistantValues(values);
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(
-                                   apiResponded ? OPEN_METEO_REFRESH_MS
-                                                : HOME_ASSISTANT_RETRY_MS));
+      const auto deadlineReached = [](unsigned long now,
+                                      unsigned long deadline) {
+        return deadline == 0 || static_cast<long>(now - deadline) >= 0;
+      };
+      unsigned long now = millis();
+      bool valuesUpdated = false;
+      if (deadlineReached(now, nextOpenMeteoRefreshAt)) {
+        const bool responded = fetchOpenMeteo(config, values);
+        nextOpenMeteoRefreshAt =
+            millis() +
+            (responded ? OPEN_METEO_REFRESH_MS : EXTERNAL_DATA_RETRY_MS);
+        valuesUpdated = true;
+      }
+
+      const bool tmepEnabled = tmepSlotsEnabled(config);
+      const bool tmepConfigured = config.tmepExportId[0] != '\0' &&
+                                  config.tmepExportKey[0] != '\0';
+      now = millis();
+      const bool tmepRefreshDue =
+          tmepConfigured && deadlineReached(now, nextTmepRefreshAt) &&
+          (tmepEnabled || !tmepCatalogPrimed);
+      if (tmepRefreshDue) {
+        const bool responded = fetchTmepValues(config, values);
+        tmepCatalogPrimed = responded;
+        nextTmepRefreshAt =
+            millis() + (responded ? TMEP_REFRESH_MS : EXTERNAL_DATA_RETRY_MS);
+        valuesUpdated = tmepEnabled;
+      } else if (!tmepConfigured) {
+        nextTmepRefreshAt = 0;
+        tmepCatalogPrimed = false;
+      }
+
+      if (valuesUpdated) {
+        lastAvailableValues = values;
+        publishHomeAssistantValues(values);
+      }
+
+      now = millis();
+      unsigned long waitMs =
+          deadlineReached(now, nextOpenMeteoRefreshAt)
+              ? 0
+              : nextOpenMeteoRefreshAt - now;
+      if (tmepConfigured && (tmepEnabled || !tmepCatalogPrimed)) {
+        const unsigned long tmepWaitMs =
+            deadlineReached(now, nextTmepRefreshAt)
+                ? 0
+                : nextTmepRefreshAt - now;
+        if (tmepWaitMs < waitMs) waitMs = tmepWaitMs;
+      }
+      if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs)) > 0) {
+        nextOpenMeteoRefreshAt = 0;
+        nextTmepRefreshAt = 0;
+        tmepCatalogPrimed = false;
+      }
       continue;
     }
+
+    nextOpenMeteoRefreshAt = 0;
+    nextTmepRefreshAt = 0;
+    tmepCatalogPrimed = false;
 
     if (config.homeAssistantUrl[0] == '\0' ||
         config.homeAssistantToken[0] == '\0') {
@@ -1091,27 +1582,49 @@ void setup() {
     Serial.println("Konfiguracni pamet se nepodarilo nacist");
 #endif
   }
+  uint32_t legacyWeatherIconColor = persistedConfig.leftWeatherIconColor;
+  if (persistedConfig.dataSource == CLOCK_DATA_SOURCE_OPEN_METEO) {
+    legacyWeatherIconColor = persistedConfig.openMeteoSlots[0].color;
+  } else if (strcmp(persistedConfig.leftSide.icon, "weather") != 0 &&
+             strcmp(persistedConfig.rightSide.icon, "weather") == 0) {
+    legacyWeatherIconColor = persistedConfig.rightWeatherIconColor;
+  }
+  clockAppearanceLoad(persistedAppearance, legacyWeatherIconColor,
+                      persistedConfig.dateFormat, persistedConfig.dateColor);
+  activeAppearance = persistedAppearance;
   runtimeConfig = persistedConfig;
   applyDevelopmentDefaults(runtimeConfig);
+  networkCoordinatorBegin();
+  tmepServiceBegin();
   LCD_Init();
   currentDisplayBrightness = runtimeConfig.dayBrightness;
   Set_Backlight(currentDisplayBrightness);
   displayDriverInit();
+  clockDashboardApplyAppearance(activeAppearance);
   clockDashboardInit(sampleValues, runtimeConfig.dayBrightness,
                        runtimeConfig.nightBrightness,
                        runtimeConfig.automaticDayNight,
                        handleBrightnessPreview, handleSettingsOpen,
                        handleSettingsSave, handleSettingsFirmwareCheck,
-                       handleSettingsFirmwareInstall);
+                       handleSettingsFirmwareInstall, handleRadarVisibility,
+                       handleRadarRangeChange);
   clockDashboardApplyConfiguration(runtimeConfig);
+  chmiRadarServiceBegin();
+  chmiRadarServiceSetActive(
+      false, false,
+      runtimeConfig.openMeteoLatitude, runtimeConfig.openMeteoLongitude,
+      runtimeConfig.radarRadiusKm, runtimeConfig.radarFrameCount,
+      runtimeConfig.radarMapOpacity, runtimeConfig.radarPauseSeconds);
   clockDashboardSetSecond(60);
   displayResyncAt = millis() + 2000;
 #if FIRMWARE_RELEASE
   improvSerialServiceInit(wifiProvisioningStart);
 #endif
   initializeNetworkTime();
-  xTaskCreatePinnedToCore(homeAssistantTask, "home-assistant", 12288, nullptr, 1,
-                          &homeAssistantTaskHandle, 0);
+  xTaskCreatePinnedToCoreWithCaps(
+      homeAssistantTask, "home-assistant", 12288, nullptr, 1,
+      &homeAssistantTaskHandle, 0,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   firmwareUpdateServiceBegin(handleFirmwareUpdateLifecycle);
   maintainFirmwareDisplayStatus();
   configurationWebBegin(loadRuntimeConfigForWeb, saveRuntimeConfig,
@@ -1119,7 +1632,10 @@ void setup() {
                         loadSunTransitionTimesForWeb,
                         requestHomeAssistantRefreshFromWeb,
                         loadDayNightStatusForWeb, handleDisplayPower,
-                        displayPowerForcedOff);
+                        displayPowerForcedOff, loadRadarRangeStateForWeb,
+                        previewRadarRangeFromWeb, loadClockAppearanceForWeb,
+                        previewClockAppearanceFromWeb,
+                        saveClockAppearanceFromWeb);
   clockDashboardSetWebMode(configurationWebMode());
 
   const esp_task_wdt_config_t watchdogConfig = {
@@ -1144,14 +1660,15 @@ void loop() {
   applyPendingHomeAssistantValues();
   const ClockConfig animationConfig = runtimeConfigSnapshot();
   const uint8_t weatherIconStyle =
-      clockDashboardNightModeEnabled()
-          ? CLOCK_WEATHER_ICON_STYLE_MONOCHROME
-          : animationConfig.weatherIconStyle;
+      clockDashboardWeatherIconStyle(animationConfig.weatherIconStyle);
   weatherAnimationServiceLoop(sampleValues.weatherCode,
                               sampleValues.weatherIsDay,
                               weatherIconStyle,
-                              animationConfig.animatedWeatherIcons &&
-                                  (animationConfig.dataSource ==
+                              !clockDashboardRadarVisible() &&
+                                  animationConfig.animatedWeatherIcons &&
+                                  (activeAppearance.style ==
+                                       CLOCK_STYLE_ANALOG ||
+                                   animationConfig.dataSource ==
                                        CLOCK_DATA_SOURCE_OPEN_METEO ||
                                    strcmp(animationConfig.leftSide.icon,
                                           "weather") == 0 ||
@@ -1159,8 +1676,19 @@ void loop() {
                                           "weather") == 0));
   configurationWebLoop();
   applyPendingRuntimeConfiguration();
-  clockDashboardLoop();
-  displayDriverLoop();
+  applyPendingClockAppearance();
+  maintainDisplayGestures();
+  maintainRadarNightVisual();
+  maintainRadarRangeChange();
+  maintainRadarDisplay();
+  maintainAutomaticRadarRotation();
+  // Během DEV screenshotu už přenášíme neměnnou kopii framebufferu. Dočasné
+  // pozastavení LVGL timerů zabrání tomu, aby GIF dekodér soupeřil s USB CDC;
+  // po dokončení přenosu se animace plynule rozběhne od dalšího snímku.
+  if (!screenshotTransferActive) {
+    clockDashboardLoop();
+    displayDriverLoop();
+  }
   if (firmwareUpdateDisplayRequested && firmwareUpdateDisplayActive) {
     firmwareUpdateDisplayPresented = true;
   }

@@ -21,7 +21,8 @@ struct ClockValues {
 
 using BrightnessPreviewCallback = void (*)(uint8_t brightness);
 using SettingsOpenCallback = void (*)();
-using SettingsSaveCallback = void (*)(uint8_t dayBrightness,
+using SettingsSaveCallback = void (*)(uint8_t clockStyle,
+                                      uint8_t dayBrightness,
                                       uint8_t nightBrightness,
                                       bool automaticDayNight,
                                       bool secondRingEnabled,
@@ -32,6 +33,8 @@ using SettingsSaveCallback = void (*)(uint8_t dayBrightness,
                                       uint8_t webMode);
 using SettingsActionCallback = void (*)();
 using ShortClickAllowedCallback = bool (*)();
+using RadarVisibilityCallback = void (*)(bool visible);
+using RadarRangeCallback = void (*)(int8_t direction);
 
 void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
                         uint8_t nightBrightness, bool automaticDayNight,
@@ -39,7 +42,9 @@ void clockDashboardInit(const ClockValues &values, uint8_t dayBrightness,
                         SettingsOpenCallback settingsOpen,
                         SettingsSaveCallback settingsSave,
                         SettingsActionCallback firmwareCheck,
-                        SettingsActionCallback firmwareInstall);
+                        SettingsActionCallback firmwareInstall,
+                        RadarVisibilityCallback radarVisibility,
+                        RadarRangeCallback radarRange);
 void clockDashboardLoop();
 // Optional integration filter for the dashboard's manual day/night short
 // click. A null callback preserves the standalone firmware behavior.
@@ -49,6 +54,11 @@ void clockDashboardShowSettings();
 void clockDashboardShowSettingsPage(uint8_t page);
 void clockDashboardSetNightMode(bool enabled);
 bool clockDashboardNightModeEnabled();
+uint8_t clockDashboardWeatherIconStyle(uint8_t configuredStyle);
+void clockDashboardHandleShortClick();
+bool clockDashboardRadarVisible();
+void clockDashboardSetRadarVisible(bool visible);
+bool clockDashboardAutomaticRotationAllowed();
 void clockDashboardSetWifiAddress(const char *ipAddress);
 void clockDashboardSetFirmwareVersion(const char *version,
                                       bool updateAvailable);
@@ -59,9 +69,18 @@ void clockDashboardSetWebActive(bool active);
 void clockDashboardSetWifiConnected(bool connected);
 void clockDashboardSetWebMode(uint8_t mode);
 void clockDashboardApplyConfiguration(const ClockConfig &config);
+void clockDashboardApplyAppearance(const ClockAppearanceConfig &appearance);
 void clockDashboardUpdate(const ClockValues &values);
 void clockDashboardSetDate(const char *dateText);
 void clockDashboardSetSecond(uint8_t second);
 void clockDashboardSetTime(const char *timeText);
 void clockDashboardSetWeatherAnimation(const uint8_t *gifData, size_t size,
                                        const char *iconKey);
+void clockDashboardSetRadarSnapshot(const uint16_t *pixels,
+                                    const char *frameTime, uint16_t radiusKm,
+                                    const char *message, bool loading,
+                                    bool fullPreparationInProgress,
+                                    bool latestFrame,
+                                    uint8_t currentFrameNumber,
+                                    uint8_t animationFrameCount,
+                                    uint8_t pauseSeconds);

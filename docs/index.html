@@ -4,11 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#05090d">
-    <meta name="description" content="Waveshare Hodiny – český Home Assistant dashboard pro kulatý dotykový displej Waveshare ESP32-S3-Touch-LCD-2.1.">
-    <title>Waveshare Hodiny</title>
-    <link rel="stylesheet" href="styles.css">
+    <meta name="description" content="Waveshare Hodiny – chytré hodiny s Open-Meteo, TMEP.cz, Home Assistantem a meteoradarem ČHMÚ pro kulatý dotykový displej.">
+    <title>Waveshare Hodiny – Chytré hodiny podle vás</title>
+    <link rel="stylesheet" href="styles.css?v=a297a80aeb8f">
     <script type="module" src="vendor/esp-web-tools/install-button.js"></script>
-    <script type="module" src="app.js"></script>
+    <script type="module" src="app.js?v=b482845fd5ca"></script>
   </head>
   <body>
     <header class="site-header">
@@ -21,6 +21,10 @@
         <a href="#instalace">Instalace</a>
         <a href="#nastaveni">Nastavení</a>
         <a href="https://github.com/CooLajz/waveshare-hodiny">GitHub</a>
+        <span class="language-switch" role="group" aria-label="Jazyk stránky">
+          <button type="button" data-language="cs" aria-label="Česky" title="Česky">🇨🇿</button>
+          <button type="button" data-language="en" aria-label="English" title="English">🇬🇧</button>
+        </span>
       </nav>
     </header>
 
@@ -28,22 +32,30 @@
       <section class="hero section-shell">
         <div class="hero-copy">
           <p class="eyebrow">Open-source firmware pro ESP32-S3</p>
-          <h1>Chytré hodiny pro <span>Home Assistant</span></h1>
-          <p class="hero-lead">Čas, počasí a domácí senzory na jednom krásném kulatém displeji. Všechno nastavíte z prohlížeče, bez úpravy zdrojového kódu.</p>
+          <h1>Chytré hodiny<br><span>podle vás</span></h1>
+          <p class="hero-lead">Čas, počasí, vlastní senzory a srážkový radar ČHMÚ na jednom krásném kulatém displeji. Fungují samostatně s Open-Meteo a TMEP.cz nebo jako součást Home Assistantu.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#instalace">Nainstalovat firmware</a>
             <a class="button button-secondary" href="https://github.com/CooLajz/waveshare-hodiny">Prohlédnout si zdrojový kód</a>
           </div>
           <p class="hardware-note">Určeno výhradně pro Waveshare ESP32-S3-Touch-LCD-2.1</p>
         </div>
-        <div class="device-stage" aria-label="Denní a noční vzhled hodin">
-          <figure class="device device-day">
-            <img src="screenshots/dashboard.png" alt="Denní dashboard Waveshare Hodiny">
-            <figcaption>Denní režim</figcaption>
+        <div class="device-stage" aria-label="Digitální a analogový vzhled hodin s meteoradarem">
+          <figure class="device device-analog">
+            <img src="screenshots/dashboard-analog.png" alt="Analogový ciferník Waveshare Hodiny">
+            <figcaption>Analogový ciferník</figcaption>
+          </figure>
+          <figure class="device device-digital-day">
+            <img src="screenshots/dashboard.png" alt="Denní digitální dashboard Waveshare Hodiny">
+            <figcaption>Digitální</figcaption>
           </figure>
           <figure class="device device-night">
             <img src="screenshots/dashboard-night.png" alt="Červený noční dashboard Waveshare Hodiny">
-            <figcaption>Noční režim</figcaption>
+            <figcaption>Noc</figcaption>
+          </figure>
+          <figure class="device device-radar">
+            <img src="screenshots/dashboard-radar.png" alt="Meteoradar ČHMÚ na displeji Waveshare Hodiny">
+            <figcaption>Meteoradar</figcaption>
           </figure>
         </div>
       </section>
@@ -54,10 +66,62 @@
           <h2>Všechno důležité, bez zbytečností</h2>
         </div>
         <div class="feature-grid">
-          <article><span class="feature-icon">◷</span><h3>Čas a vteřiny</h3><p>Tři efekty vteřinového prstence včetně plynulé komety.</p></article>
-          <article><span class="feature-icon">⌂</span><h3>Home Assistant</h3><p>Počasí, teploty a další entity přímo přes REST API.</p></article>
-          <article><span class="feature-icon">☼</span><h3>Den a noc</h3><p>Samostatný jas a automatický červený noční režim.</p></article>
+          <article><span class="feature-icon">◷</span><h3>Počasí a vlastní senzory</h3><p>Open-Meteo funguje bez účtu, <a href="https://www.tmep.cz/" target="_blank" rel="noopener noreferrer" aria-label="Navštívit TMEP.cz">TMEP.cz</a> přidá hodnoty z vlastních čidel a Home Assistant nabídne další entity.</p></article>
+          <article><span class="feature-icon">⌁</span><h3>Meteoradar ČHMÚ</h3><p>Animace srážek, mapa ČR, města a pět volitelných rozsahů pro lokality v Česku.</p></article>
+          <article><span class="feature-icon">☼</span><h3>Den a noc</h3><p>Ruční i automatický noční režim včetně červeného meteoradaru.</p></article>
           <article><span class="feature-icon">↻</span><h3>Aktualizace</h3><p>Bezpečné veřejné OTA z GitHub Pages s kontrolou velikosti a SHA-256.</p></article>
+        </div>
+      </section>
+
+      <section class="display-gallery section-shell section-block">
+        <div class="section-heading narrow">
+          <p class="eyebrow">Vzhled displeje</p>
+          <h2>Digitální nebo analogové. Ve dne i v noci.</h2>
+          <p>Vyberte si klasické digitální rozložení nebo nový analogový ciferník s vlastním barevným tónem. Oba vzhledy sdílejí naměřené hodnoty, počasí i automatický noční režim a doplňuje je animovaný meteoradar ČHMÚ.</p>
+        </div>
+        <div class="clock-gallery">
+          <figure>
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard-analog.png" aria-label="Zobrazit denní analogový ciferník v plné velikosti">
+              <img src="screenshots/dashboard-analog.png" alt="Analogový ciferník Waveshare Hodiny v denním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Analogový ciferník · denní režim</figcaption>
+          </figure>
+          <figure>
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard.png" aria-label="Zobrazit denní digitální ciferník v plné velikosti">
+              <img src="screenshots/dashboard.png" alt="Digitální ciferník Waveshare Hodiny v denním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Digitální ciferník · denní režim</figcaption>
+          </figure>
+          <figure>
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard-radar.png" aria-label="Zobrazit denní meteoradar ČHMÚ v plné velikosti">
+              <img src="screenshots/dashboard-radar.png" alt="Meteoradar ČHMÚ na displeji Waveshare Hodiny v denním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Meteoradar ČHMÚ · denní režim</figcaption>
+          </figure>
+          <figure class="night-preview">
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard-analog-night.png" aria-label="Zobrazit noční analogový ciferník v plné velikosti">
+              <img src="screenshots/dashboard-analog-night.png" alt="Analogový ciferník Waveshare Hodiny v červeném nočním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Analogový ciferník · noční režim</figcaption>
+          </figure>
+          <figure class="night-preview">
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard-night.png" aria-label="Zobrazit noční digitální ciferník v plné velikosti">
+              <img src="screenshots/dashboard-night.png" alt="Digitální ciferník Waveshare Hodiny v červeném nočním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Digitální ciferník · noční režim</figcaption>
+          </figure>
+          <figure class="night-preview">
+            <button class="image-zoom" type="button" data-full="screenshots/dashboard-radar-night.png" aria-label="Zobrazit noční meteoradar ČHMÚ v plné velikosti">
+              <img src="screenshots/dashboard-radar-night.png" alt="Meteoradar ČHMÚ na displeji Waveshare Hodiny v červeném nočním režimu">
+              <span>Zvětšit</span>
+            </button>
+            <figcaption>Meteoradar ČHMÚ · noční režim</figcaption>
+          </figure>
         </div>
       </section>
 
@@ -95,12 +159,17 @@
             <div class="installer-orbit" aria-hidden="true"><span></span></div>
             <p class="installer-label">Veřejný stabilní firmware</p>
             <p class="installer-version" id="firmware-version">Zjišťuji dostupnost…</p>
+            <label class="firmware-select-label" for="firmware-select">Vyberte verzi firmware</label>
+            <select class="firmware-select" id="firmware-select" disabled>
+              <option>Načítám dostupné verze…</option>
+            </select>
             <esp-web-install-button id="install-button">
               <button class="button button-primary install-action" slot="activate" type="button">Připojit zařízení</button>
               <p slot="unsupported">Tento prohlížeč nepodporuje Web Serial. Otevřete stránku v desktopovém Chromu nebo Edge.</p>
               <p slot="not-allowed">Přístup k sériovému portu není povolený. Otevřete stránku přes zabezpečené HTTPS.</p>
             </esp-web-install-button>
             <p class="installer-status" id="installer-status" role="status">Instalátor se připravuje.</p>
+            <p class="installer-downgrade" id="installer-downgrade" role="status" hidden><strong>Instalujete starší verzi.</strong> Konfigurace vytvořená novějším firmwarem nemusí být se starší verzí plně kompatibilní. Pokud zařízení po návratu nefunguje správně, může být nutná čistá instalace se smazáním uživatelských dat.</p>
             <p class="installer-warning"><strong>Pozor:</strong> první čistá instalace může vymazat uložená data zařízení. Aktualizace stejného layoutu je nabídnuta bez mazání.</p>
           </div>
         </div>
@@ -110,7 +179,7 @@
         <div class="section-heading narrow">
           <p class="eyebrow">Displej podle Vás</p>
           <h2>Barvy, jas i chování nastavíte ve webu</h2>
-          <p>Každá veličina může mít vlastní plynulou barevnou škálu. Denní a noční jas, animace i entity změníte bez nového sestavení firmware.</p>
+          <p>Každá veličina může mít vlastní plynulou barevnou škálu. Denní a noční jas, meteoradar, animace i entity změníte bez nového sestavení firmware. Při vypnuté automatice přepne krátký dotyk denní a noční vzhled na hodinách i radaru.</p>
         </div>
         <div class="showcase-grid">
           <figure>
